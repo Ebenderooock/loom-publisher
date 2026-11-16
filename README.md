@@ -71,7 +71,7 @@ this bootstrap. Keep `PUBLISHING_ENABLED` unset until completion.
    permissions alone are **not** sufficient: a branch workflow can request
    `packages: write`. Verify neither repository's `GITHUB_TOKEN` can start a blob
    upload to the production package before activation; no image/tag needs to be
-   published. Cancel any unexpectedly authorized empty upload and stop cutover.
+   published. Stop cutover if an unapproved workflow can start an upload.
    Do not test by overwriting production tags. Leave the package public/source-linked as desired
    but decouple inherited write access; remove old publication credentials.
 5. Create a classic package-publishing PAT owned by the package publishing
@@ -85,8 +85,10 @@ this bootstrap. Keep `PUBLISHING_ENABLED` unset until completion.
    Run **Verify publishing credential** on publisher `main` to validate the
    configured PAT's identity, package-only scopes, and actual package Write
    access while `PUBLISHING_ENABLED` is still false. This workflow checks out
-   no source, starts and cancels an empty blob upload, and publishes no image,
-   tag, or package version. It is also suitable for verifying a rotated PAT.
+   no source and completes a fixed zero-byte, unreferenced blob upload; it
+   publishes no image, tag, or package version. GHCR rejects upload cancellation,
+   so completing the zero-byte blob closes the session without leaving an open
+   upload. The check is also suitable for verifying a rotated PAT.
 6. Create a GitHub App installed **only on Ebenderooock/loom** with:
    **Contents read/write**, **Commit statuses read/write**, **Actions read**,
    **Checks read** (authoritative push before/after metadata);
