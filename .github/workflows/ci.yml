@@ -1,0 +1,64 @@
+name: Publisher CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s tests -v
+      - run: python3 -m py_compile publisher.py build.py tests/test_publisher.py
+      - name: Workflow lint (fixed version; no publishing credentials)
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= .github/workflows/*.yml
+  oci-transport:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Install local OCI transport
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
+      - name: Verify actual single-platform and multi-platform OCI archives
+        env:
+          OCI_SMOKE_DIR: ${{ runner.temp }}/oci-smoke
+        run: |
+          set -euo pipefail
+          mkdir -p "$OCI_SMOKE_DIR"
+          docker buildx build --platform linux/amd64 \
+            --provenance=false --sbom=false --tag smoke:single \
+            --output "type=oci,dest=$OCI_SMOKE_DIR/single.tar" \
+            tests/fixtures/oci
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --provenance=false --sbom=false --tag smoke:multi \
+            --output "type=oci,dest=$OCI_SMOKE_DIR/multi.tar" \
+            tests/fixtures/oci
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from publisher import validate_oci
+          root = Path(os.environ["OCI_SMOKE_DIR"])
+          validate_oci(root / "single.tar", ["amd64"], "1.2.3", "a" * 40)
+          validate_oci(root / "multi.tar", ["amd64", "arm64"], "1.2.3", "a" * 40)
+          PY
+          skopeo copy --all --preserve-digests \
+            "oci-archive:$OCI_SMOKE_DIR/single.tar" "oci:$OCI_SMOKE_DIR/import-single:smoke"
+          skopeo copy --all --preserve-digests \
+            "oci-archive:$OCI_SMOKE_DIR/multi.tar" "oci:$OCI_SMOKE_DIR/import-multi:smoke"
+          for arch in amd64 arm64; do
+            skopeo copy --override-os linux --override-arch "$arch" --preserve-digests \
+              "oci-archive:$OCI_SMOKE_DIR/multi.tar" "oci:$OCI_SMOKE_DIR/import-$arch:smoke"
+            skopeo inspect --config "oci:$OCI_SMOKE_DIR/import-$arch:smoke" \
+              | python3 -c 'import json, sys; assert json.load(sys.stdin)["architecture"] == sys.argv[1]' "$arch"
+          done

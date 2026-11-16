@@ -1,0 +1,191 @@
+name: Trusted publisher
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Optional full source ref (empty = discover eligible current tips)"
+        required: false
+        type: string
+
+# No automatic package write in this repository, on ANY job.
+permissions:
+  contents: read
+
+# One control/build/publish transaction at a time, including manual runs.
+concurrency:
+  group: production-publish
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: vars.PUBLISHING_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail closed before requesting environment credentials
+        env:
+          ENABLED: ${{ vars.PUBLISHING_ENABLED }}
+          APP_ID: ${{ vars.LOOM_APP_ID }}
+          PUBLISH_USERNAME: ${{ vars.GHCR_PUBLISH_USERNAME }}
+          BASELINE: ${{ vars.PUBLISHING_NOT_BEFORE }}
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          test "${REPOSITORY,,}" = "ebenderooock/loom-publisher" || { echo "::error::Wrong repository"; exit 1; }
+          test "$REF" = "refs/heads/main" || { echo "::error::Publisher main only"; exit 1; }
+          test "$ENABLED" = "true" || { echo "::error::PUBLISHING_ENABLED must be true after owner setup"; exit 1; }
+          test -n "$APP_ID" || { echo "::error::LOOM_APP_ID is missing"; exit 1; }
+          test -n "$PUBLISH_USERNAME" || { echo "::error::GHCR_PUBLISH_USERNAME is missing"; exit 1; }
+          python3 -c 'import datetime, os; datetime.datetime.strptime(os.environ["BASELINE"], "%Y-%m-%dT%H:%M:%SZ")'
+
+  discover:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production-publish
+    outputs:
+      candidate: ${{ steps.discover.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require protected environment secrets
+        env:
+          APP_KEY: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
+          PACKAGE_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$APP_KEY" || { echo "::error::production-publish LOOM_APP_PRIVATE_KEY missing"; exit 1; }
+          test -n "$PACKAGE_TOKEN" || { echo "::error::production-publish GHCR_PUBLISH_TOKEN missing"; exit 1; }
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.LOOM_APP_ID }}
+          private-key: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
+          owner: Ebenderooock
+          repositories: loom
+          permission-actions: read
+          permission-checks: read
+          permission-contents: write
+          permission-statuses: write
+      - name: Discover and mark pending
+        id: discover
+        env:
+          LOOM_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          PUBLISHING_ENABLED: ${{ vars.PUBLISHING_ENABLED }}
+          PUBLISHING_NOT_BEFORE: ${{ vars.PUBLISHING_NOT_BEFORE }}
+          PUBLISHER_RUN_URL: https://github.com/Ebenderooock/loom-publisher/actions/runs/${{ github.run_id }}
+        run: python3 publisher.py discover
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.candidate != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Deliberately NO environment, App token, GHCR credential, shared caches,
+    # self-hosted runner, or registry login. Source code is untrusted here.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Ebenderooock/loom
+          ref: ${{ fromJSON(needs.discover.outputs.candidate).sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: startsWith(fromJSON(needs.discover.outputs.candidate).ref, 'refs/tags/')
+        with:
+          go-version: "1.26.11"
+          cache: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: startsWith(fromJSON(needs.discover.outputs.candidate).ref, 'refs/tags/')
+        with:
+          node-version: "22"
+      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        if: startsWith(fromJSON(needs.discover.outputs.candidate).ref, 'refs/tags/')
+        id: syft
+        with:
+          syft-version: v1.57.1
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build only; never publish
+        env:
+          CANDIDATE: ${{ needs.discover.outputs.candidate }}
+          SYFT_CMD: ${{ steps.syft.outputs.cmd }}
+          TVDB_APIKEY: ${{ secrets.TVDB_APIKEY }}
+        run: python3 build.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: payload-${{ github.run_attempt }}
+          path: payload/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    needs: [discover, build]
+    if: always() && !cancelled() && needs.discover.result == 'success' && needs.discover.outputs.candidate != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production-publish
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.LOOM_APP_ID }}
+          private-key: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
+          owner: Ebenderooock
+          repositories: loom
+          permission-actions: read
+          permission-contents: write
+          permission-statuses: write
+      - name: Install registry data-copy tool
+        if: needs.build.result == 'success'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: needs.build.result == 'success'
+        with:
+          name: payload-${{ github.run_attempt }}
+          path: payload
+      - name: Validate, reauthorize, and publish data only
+        if: needs.build.result == 'success'
+        id: publish
+        env:
+          LOOM_TOKEN: ${{ steps.app.outputs.token }}
+          CANDIDATE: ${{ needs.discover.outputs.candidate }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+          GHCR_USERNAME: ${{ vars.GHCR_PUBLISH_USERNAME }}
+          PUBLISHING_ENABLED: ${{ vars.PUBLISHING_ENABLED }}
+          PUBLISHING_NOT_BEFORE: ${{ vars.PUBLISHING_NOT_BEFORE }}
+          PUBLISHER_RUN_URL: https://github.com/Ebenderooock/loom-publisher/actions/runs/${{ github.run_id }}
+        run: python3 publisher.py publish
+      - name: Report build or publication failure on source
+        if: always() && steps.app.outcome == 'success' && (needs.build.result != 'success' || steps.publish.outcome != 'success')
+        env:
+          LOOM_TOKEN: ${{ steps.app.outputs.token }}
+          CANDIDATE: ${{ needs.discover.outputs.candidate }}
+          PUBLISHING_ENABLED: ${{ vars.PUBLISHING_ENABLED }}
+          PUBLISHER_RUN_URL: https://github.com/Ebenderooock/loom-publisher/actions/runs/${{ github.run_id }}
+        run: python3 publisher.py failure
+      - name: Propagate failed build
+        if: needs.build.result != 'success'
+        run: |
+          echo "::error::Source build failed; source status marked failure"
+          exit 1
