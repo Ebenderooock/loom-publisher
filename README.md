@@ -85,10 +85,13 @@ this bootstrap. Keep `PUBLISHING_ENABLED` unset until completion.
    Run **Verify publishing credential** on publisher `main` to validate the
    configured PAT's identity, package-only scopes, and actual package Write
    access while `PUBLISHING_ENABLED` is still false. This workflow checks out
-   no source and completes a fixed zero-byte, unreferenced blob upload; it
-   publishes no image, tag, or package version. GHCR rejects upload cancellation,
-   so completing the zero-byte blob closes the session without leaving an open
-   upload. The check is also suitable for verifying a rotated PAT.
+   no source and requires the registry to authorize an empty upload-initiation
+   request (HTTP 202); it transfers no blob data or manifest and publishes no
+   image, tag, or package version. The empty probe is not finalized and its
+   cleanup is left to the registry, explicitly reported as a warning. This is
+   an authorization check, not an end-to-end publication test. Verify actual
+   publication separately through the normal publisher workflow. The check is
+   also suitable for verifying a rotated PAT.
 6. Create a GitHub App installed **only on Ebenderooock/loom** with:
    **Contents read/write**, **Commit statuses read/write**, **Actions read**,
    **Checks read** (authoritative push before/after metadata);
