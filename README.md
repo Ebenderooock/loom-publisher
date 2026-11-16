@@ -182,6 +182,32 @@ GoReleaser; **no GoReleaser hooks/config/skip flags are used**. It preserves
 The release runtime follows the previous COPY-only GoReleaser image (no Rain).
 Main/channel images retain the source Dockerfile, Rain and TVDB build argument.
 
+### Release notes
+
+For `v<semver>` tags, the trusted publisher reads **`CHANGELOG.md` from the exact
+peeled source commit SHA**, through the source repository Contents API. Before
+any image or release writes, it requires one non-empty level-two section for
+that exact version (including any prerelease/build metadata), for example
+`## [0.4.2] - 2026-11-17`. Bracketed or bare versions, with or without a date,
+are supported. The heading is omitted; the Markdown body ends at the next
+level-two heading, retaining nested headings and lists. Fenced examples are
+not interpreted as section headings.
+
+Missing/unreadable files, missing/empty sections, and duplicate matching
+sections fail publication. There is **no Unreleased or generated-notes
+fallback**. Prepare the versioned changelog before tagging; a later main-branch
+edit cannot repair the changelog at an existing tag. Standard inline/image
+links and reference definitions within the section resolve relative paths
+against the source repository's `blob/<SHA>/` URLs (fragment-only links point
+to `CHANGELOG.md` at that SHA); absolute URLs are unchanged. Keep referenced
+link definitions inside the versioned section, or use absolute URLs.
+
+The trusted publisher run-link marker remains the first paragraph. Recovery
+of an App-owned matching draft validates the changelog again and replaces old
+notes with this body when finalizing, after asset uploads and the existing
+ownership/ref/CI checks. Source Markdown is inert data: no source scripts,
+templates, or GoReleaser configuration run in publication jobs.
+
 ## Retry and limitations
 
 - One transaction at a time; no historical matrix fan-out. Eligible releases
@@ -217,8 +243,8 @@ Main/channel images retain the source Dockerfile, Rain and TVDB build argument.
   commit comparison. New branches and comparisons reaching GitHub's 300-file
   cap conservatively publish. Explicit dispatch can publish a docs-only tip
   after successful CI, as the previous manual workflow allowed.
-- Release notes use GitHub-generated notes with a trusted publisher run link rather
-  than source-driven GoReleaser changelogs. No cosign signatures are produced
+- Release notes use the tagged source's versioned changelog section with a trusted
+  publisher run link, not GitHub-generated notes. No cosign signatures are produced
   (the previous release workflow installed cosign but did not sign outputs).
 - Hosted image/tool dependencies are not fully hermetic (base images, apt,
   toolchain downloads). All third-party Actions are full-SHA pinned; Syft and
