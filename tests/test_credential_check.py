@@ -44,24 +44,30 @@ class CredentialCheckTests(unittest.TestCase):
         return Response({"login": owner}, headers={"X-OAuth-Scopes": scopes})
 
     def test_authorized_empty_upload_is_cancelled_without_publishing(self):
-        requests, output = self.execute([
-            self.identity(),
-            Response({"token": "fake-registry-token"}),
-            Response(status=202, headers={
-                "Location": "/v2/ebenderooock/loom/blobs/uploads/test-session",
-            }),
-            Response(status=204),
-        ])
-        self.assertEqual(
-            [call.args[0].get_method() for call in requests],
-            ["GET", "GET", "POST", "DELETE"],
-        )
-        self.assertEqual(requests[2].args[0].data, b"")
-        self.assertEqual(requests[3].args[0].full_url,
-                         "https://ghcr.io/v2/ebenderooock/loom/blobs/uploads/test-session")
-        self.assertIn("Empty upload cancelled", output)
-        self.assertNotIn("fake-secret", output)
-        self.assertNotIn("fake-registry-token", output)
+        for location, expected in [
+            ("/v2/ebenderooock/loom/blobs/upload/19.test-session?state=test",
+             "https://ghcr.io/v2/ebenderooock/loom/blobs/upload/19.test-session?state=test"),
+            ("/v2/ebenderooock/loom/blobs/uploads/test-session",
+             "https://ghcr.io/v2/ebenderooock/loom/blobs/uploads/test-session"),
+            ("test-session",
+             "https://ghcr.io/v2/ebenderooock/loom/blobs/uploads/test-session"),
+        ]:
+            with self.subTest(location=location):
+                requests, output = self.execute([
+                    self.identity(),
+                    Response({"token": "fake-registry-token"}),
+                    Response(status=202, headers={"Location": location}),
+                    Response(status=204),
+                ])
+                self.assertEqual(
+                    [call.args[0].get_method() for call in requests],
+                    ["GET", "GET", "POST", "DELETE"],
+                )
+                self.assertEqual(requests[2].args[0].data, b"")
+                self.assertEqual(requests[3].args[0].full_url, expected)
+                self.assertIn("Empty upload cancelled", output)
+                self.assertNotIn("fake-secret", output)
+                self.assertNotIn("fake-registry-token", output)
 
     def test_wrong_owner_and_broader_scopes_fail_before_registry_access(self):
         for owner, scopes, message in [
