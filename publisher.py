@@ -2,6 +2,7 @@
 """Trusted policy and control plane. Never import code from the source checkout."""
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -508,22 +509,80 @@ def registry_latest():
     return value
 
 
-def publish_release(api, candidate, directory, advance):
+def release_notes(api, candidate):
+    kind, value = ref_policy(candidate["ref"])
+    require(kind == "release" and SHA.fullmatch(candidate["sha"]),
+            "Release notes require a tagged source commit")
+    file = api.call(source_path("contents/CHANGELOG.md?ref=" + candidate["sha"]))
+    require(file.get("type") == "file" and file.get("encoding") == "base64"
+            and isinstance(file.get("content"), str), "Missing CHANGELOG.md content")
+    changelog = base64.b64decode(file["content"].replace("\n", ""), validate=True).decode("utf-8-sig")
+    heading = re.compile(r"^ {0,3}##(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$")
+    matching = re.compile(rf"(?:\[{re.escape(value)}\]|{re.escape(value)})(?:[ \t]+- .+)?")
+    lines = []
+    found = False
+    active = False
+    fence = None
+    base = f"https://github.com/{SOURCE}/blob/{candidate['sha']}/"
+
+    def destination(match):
+        prefix, link = match.groups()
+        target = link.strip("<>")
+        if not urllib.parse.urlsplit(target).scheme and not target.startswith("//"):
+            target = urllib.parse.urljoin(
+                base + "CHANGELOG.md", target if not target.startswith("/") else base + target[1:])
+            link = "<" + target + ">" if link.startswith("<") else target
+        return prefix + link
+
+    for line in changelog.splitlines():
+        # Headings and links in fenced examples are data, not changelog structure.
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence:
+            if active:
+                lines.append(line)
+            if (marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
+                    and not marker[2].strip()):
+                fence = None
+            continue
+        if marker:
+            fence = marker[1]
+        section = heading.fullmatch(line) if not marker else None
+        if section:
+            active = matching.fullmatch(section[1] or "") is not None
+            if active:
+                require(not found, f"Duplicate CHANGELOG.md section for {value}")
+                found = True
+            continue
+        if active:
+            if not marker:
+                # Standard inline/image links and reference definitions. Absolute
+                # URLs remain unchanged; relative links resolve at the same SHA.
+                line = re.sub(r"(!?\[[^\]\n]*\]\()[ \t]*(<[^>\n]+>|[^\s()]+)"
+                              r"(?=[ \t]*(?:[\"'][^\n]*[\"'][ \t]*)?\))", destination, line)
+                line = re.sub(r"^( {0,3}\[[^\]\n]+\]:[ \t]*)(<[^>\n]+>|[^\s]+)",
+                              destination, line)
+            lines.append(line)
+    require(found, f"Missing CHANGELOG.md section for {value}")
+    notes = "\n".join(lines).strip()
+    content = re.sub(r"<!--.*?-->", "", notes, flags=re.DOTALL)
+    require(any(line.strip() and not re.match(r"^\s*#{1,6}(?:\s|$)", line)
+                for line in content.splitlines()), f"Empty CHANGELOG.md section for {value}")
+    return notes
+
+
+def publish_release(api, candidate, directory, advance, notes):
     _, value = ref_policy(candidate["ref"])
     tag = short_ref(candidate["ref"])
+    body = ("Built by the trusted [publisher]("
+            + os.environ["PUBLISHER_RUN_URL"] + ").\n\n" + notes)
     release = release_record(api, candidate["ref"])
     if release:
         require_owned_draft(release, candidate)
     else:
-        notes = api.call(source_path("releases/generate-notes"), {
-            "tag_name": tag, "target_commitish": candidate["sha"],
-        })
-        require(isinstance(notes.get("body"), str), "Missing generated release notes")
         # Draft first: a partial upload must not masquerade as a complete release.
         release = api.call(source_path("releases"), {
             "tag_name": tag, "target_commitish": candidate["sha"], "name": tag,
-            "body": "Built by the trusted [publisher]("
-                    + os.environ["PUBLISHER_RUN_URL"] + ").\n\n" + notes["body"],
+            "body": body,
             "draft": True, "prerelease": version(value)[1] is not None,
             "make_latest": "false",
         })
@@ -549,6 +608,7 @@ def publish_release(api, candidate, directory, advance):
     # Refuse a concurrent manual publication instead of modifying a public release.
     require_owned_draft(api.call(source_path(f"releases/{release_id}")), candidate)
     api.call(source_path(f"releases/{release_id}"), {
+        "body": body,
         "draft": False, "prerelease": version(value)[1] is not None,
         "make_latest": "true" if advance else "false",
     }, method="PATCH")
@@ -566,6 +626,8 @@ def publish(api, candidate, directory):
         existing = release_record(api, candidate["ref"])
         if existing:
             require_owned_draft(existing, candidate)
+        # Fail before any registry/release writes, including on draft recovery.
+        notes = release_notes(api, candidate)
     require({p.name for p in directory.iterdir()} ==
             ({"image.tar", "assets"} if kind == "release" else {"image.tar"}),
             "Unexpected artifact payload")
@@ -613,7 +675,7 @@ def publish(api, candidate, directory):
                             "oci-archive:" + str(directory / "image.tar"),
                             "docker://" + IMAGE + ":latest"], check=True)
         revalidate(api, candidate)
-        publish_release(api, candidate, directory / "assets", advance)
+        publish_release(api, candidate, directory / "assets", advance, notes)
 
 
 def main():

@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import io
 import json
@@ -19,6 +20,11 @@ import publisher as p
 SHA = "a" * 40
 OTHER = "b" * 40
 URL = "https://github.com/Ebenderooock/loom-publisher/actions/runs/123"
+
+
+def changelog_file(text):
+    return {"type": "file", "encoding": "base64",
+            "content": base64.encodebytes(text.encode()).decode()}
 
 
 def run(ref="refs/heads/main", **changes):
@@ -44,6 +50,7 @@ class FakeAPI:
         self.comparison = {"status": "ahead", "merge_base_commit": {"sha": SHA}}
         self.diff = {"status": "ahead", "files": [{"filename": "internal/main.go"}]}
         self.workflow = {"id": p.CI_ID, "path": p.CI_PATH, "state": "active"}
+        self.changelog = changelog_file(f"## [{p.ref_policy(ref)[1]}] - 2026-01-02\n\n- Fixes.")
 
     def call(self, path, data=None, method=None, raw=None):
         path = path.removeprefix(p.source_path(""))
@@ -52,6 +59,8 @@ class FakeAPI:
             return data
         if path == "actions/workflows/ci.yml":
             return self.workflow
+        if path == "contents/CHANGELOG.md?ref=" + SHA:
+            return self.changelog
         if path.startswith("git/ref/"):
             return {"object": {"sha": self.tip, "type": "commit"}}
         if path == "commits/" + SHA:
@@ -503,6 +512,95 @@ class ArtifactTests(unittest.TestCase):
             p.validate_assets(directory, "1.2.3")
 
 
+class ReleaseNotesTests(unittest.TestCase):
+    def setUp(self):
+        self.candidate = {"ref": "refs/tags/v0.4.2", "sha": SHA}
+        self.api = Mock()
+
+    def notes(self, changelog, value="0.4.2"):
+        self.api.call.return_value = changelog_file(changelog)
+        return p.release_notes(self.api, self.candidate | {"ref": "refs/tags/v" + value})
+
+    def test_exact_section_at_source_sha_preserves_markdown(self):
+        body = "### Added\n\n- Detailed feature.\n\n### Fixed\n\n- Import fixes."
+        self.assertEqual(self.notes(
+            "# Changelog\n\n## [Unreleased]\n\n- Future.\n\n"
+            "## [0.4.20] - 2026-01-03\n\n- Wrong patch.\n\n"
+            "## [0.4.2] - 2026-01-02\n\n" + body
+            + "\n\n## Migration notes\n\nNot this version.\n"), body)
+        self.api.call.assert_called_once_with(p.source_path("contents/CHANGELOG.md?ref=" + SHA))
+        for boundary in ("##", "## ", "## Other notes"):
+            with self.subTest(boundary=boundary):
+                self.assertEqual(self.notes(
+                    "## [0.4.2]\n- Fix.\n" + boundary + "\nNot release notes."), "- Fix.")
+
+    def test_version_heading_forms_and_exact_prerelease_metadata(self):
+        for heading in ("## [0.4.2]", "## 0.4.2", "## 0.4.2 - 2026-01-02",
+                        "  ## [0.4.2] - 2026-01-02 ##"):
+            with self.subTest(heading=heading):
+                self.assertEqual(self.notes(heading + "\r\n\r\n- Fix.\r\n"), "- Fix.")
+        value = "0.4.2-rc.1+build.2"
+        self.assertEqual(self.notes(
+            "## [0.4.2]\nStable.\n## [0.4.2-rc.1+build.2]\nCandidate.\n"
+            "## [0.4.2-rc.1+build.3]\nOther.", value), "Candidate.")
+        for other in ("0.4.20", "0.4.2-rc.1", "0.4.2+build.2", "Unreleased", "v0.4.2"):
+            with self.subTest(other=other), self.assertRaisesRegex(ValueError, "Missing"):
+                self.notes(f"## [{other}]\n\n- Not this release.")
+
+    def test_missing_empty_and_duplicate_sections_fail_closed(self):
+        for text, error in (
+            ("# Changelog\n", "Missing"),
+            ("## [Unreleased]\n- Future.\n", "Missing"),
+            ("## [0.4.2]###\n- Not an exact version heading.", "Missing"),
+            ("## [0.4.2]\n \n## [0.4.1]\n- Old.", "Empty"),
+            ("## [0.4.2]\n### Fixed\n\n<!-- TODO -->\n", "Empty"),
+            ("## [0.4.2]\n- One.\n## [0.4.2]\n- Two.", "Duplicate"),
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, error):
+                self.notes(text)
+
+    def test_fenced_headings_and_commands_remain_inert_data(self):
+        body = "### Usage\n\n```sh\n## [0.4.1]\n$(do-not-run)\n```\n\n- Fix."
+        self.assertEqual(self.notes(
+            "~~~markdown\n## [0.4.2]\n- Example only.\n~~~\n\n"
+            "## [0.4.2]\n" + body + "\n## [0.4.1]\n- Old."), body)
+
+    def test_relative_documentation_links_resolve_at_source_sha(self):
+        base = f"https://github.com/{p.SOURCE}/blob/{SHA}/"
+        self.assertEqual(self.notes(
+            "## [0.4.2]\n"
+            '- [Guide](docs/guide.md#setup "Setup")\n'
+            "- [Readme](./README.md) ![Image](/docs/image.png)\n"
+            "- [Section](#details) [External](https://example.com/doc)\n"
+            "- [Mail](mailto:maintainer@example.com) [CDN](//example.com/doc)\n"
+            "- [Reference][guide]\n\n[guide]: <docs/guide.md> \"Guide\"\n"
+            "```\n[Example](docs/example.md)\n```"),
+            f'- [Guide]({base}docs/guide.md#setup "Setup")\n'
+            f"- [Readme]({base}README.md) ![Image]({base}docs/image.png)\n"
+            f"- [Section]({base}CHANGELOG.md#details) [External](https://example.com/doc)\n"
+            "- [Mail](mailto:maintainer@example.com) [CDN](//example.com/doc)\n"
+            f'- [Reference][guide]\n\n[guide]: <{base}docs/guide.md> "Guide"\n'
+            "```\n[Example](docs/example.md)\n```")
+
+    def test_missing_unreadable_or_invalid_file_has_no_fallback(self):
+        error = urllib.error.HTTPError("", 404, "Not Found", {}, None)
+        self.addCleanup(error.close)
+        self.api.call.side_effect = error
+        with self.assertRaises(urllib.error.HTTPError):
+            p.release_notes(self.api, self.candidate)
+        self.api.call.assert_called_once()
+        self.api.call.side_effect = None
+        for file in (
+            {"type": "file", "encoding": "none", "content": ""},
+            {"type": "dir", "encoding": "base64", "content": ""},
+            {"type": "file", "encoding": "base64", "content": "%%%"},
+            {"type": "file", "encoding": "base64", "content": "/w=="},
+        ):
+            self.api.call.return_value = file
+            with self.subTest(file=file), self.assertRaises(ValueError):
+                p.release_notes(self.api, self.candidate)
+
+
 class PublicationTests(unittest.TestCase):
     def test_release_notes_remain_data_beneath_the_publisher_marker(self):
         candidate = p.authorize(FakeAPI("refs/tags/v1.2.3"), "refs/tags/v1.2.3")
@@ -513,17 +611,121 @@ class PublicationTests(unittest.TestCase):
                  "body": marker + "\n\n" + notes}
         api = Mock()
         api.pages.return_value = iter([])
-        api.call.side_effect = [{"body": notes}, {"id": 5}, None, draft, None]
+        api.call.side_effect = [{"id": 5}, None, draft, None]
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             (directory / "checksums.txt").write_text("checksum data")
             with patch.dict(os.environ, APP_SLUG="publisher", PUBLISHER_RUN_URL=URL):
                 with patch("publisher.release_record", return_value=None):
                     with patch("publisher.revalidate"):
-                        p.publish_release(api, candidate, directory, False)
+                        p.publish_release(api, candidate, directory, False, notes)
                 p.require_owned_draft(draft, candidate)
-        body = api.call.call_args_list[1].args[1]["body"]
+        body = api.call.call_args_list[0].args[1]["body"]
         self.assertEqual(body, marker + "\n\n" + notes)
+        self.assertEqual(api.call.call_args_list[-1].args[1]["body"], body)
+        self.assertTrue(api.call.call_args_list[0].args[1]["draft"])
+        self.assertFalse(api.call.call_args_list[-1].args[1]["draft"])
+
+    def test_owned_draft_retry_refreshes_notes_after_upload_and_revalidation(self):
+        candidate = {"ref": "refs/tags/v1.2.3", "sha": SHA}
+        draft = {"id": 5, "draft": True, "author": {"login": "publisher[bot]"},
+                 "target_commitish": SHA, "tag_name": "v1.2.3",
+                 "body": "Built by the trusted [publisher](" + URL + ").\n\nOld generated notes."}
+        api = Mock()
+        api.pages.return_value = iter([])
+        api.call.side_effect = [None, draft, None]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "checksums.txt").write_text("checksum data")
+            with patch.dict(os.environ, APP_SLUG="publisher", PUBLISHER_RUN_URL=URL):
+                with patch("publisher.release_record", return_value=draft):
+                    with patch("publisher.revalidate") as revalidate:
+                        api.attach_mock(revalidate, "revalidate")
+                        p.publish_release(api, candidate, Path(tmp), True, "- Changelog notes.")
+        self.assertEqual([call[0] for call in api.mock_calls],
+                         ["pages", "call", "revalidate", "call", "call"])
+        path, data = api.call.call_args.args
+        self.assertEqual(path, p.source_path("releases/5"))
+        self.assertEqual(api.call.call_args.kwargs, {"method": "PATCH"})
+        self.assertEqual(data, {"body": draft["body"].split("\n\n")[0] + "\n\n- Changelog notes.",
+                                "draft": False, "prerelease": False, "make_latest": "true"})
+
+    def test_draft_recovery_keeps_asset_digest_and_ownership_guards(self):
+        candidate = {"ref": "refs/tags/v1.2.3", "sha": SHA}
+        draft = {"id": 5, "draft": True, "author": {"login": "publisher[bot]"},
+                 "target_commitish": SHA, "tag_name": "v1.2.3",
+                 "body": "Built by the trusted [publisher](" + URL + ")."}
+        digest = "sha256:" + hashlib.sha256(b"checksum data").hexdigest()
+        for existing_digest in (digest, "sha256:" + "0" * 64):
+            with self.subTest(digest=existing_digest), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "checksums.txt").write_bytes(b"checksum data")
+                api = Mock()
+                api.pages.return_value = iter([
+                    {"id": 9, "name": "checksums.txt", "digest": existing_digest}])
+                api.call.side_effect = ([draft, None] if existing_digest == digest
+                                        else [None, None, draft, None])
+                with patch.dict(os.environ, APP_SLUG="publisher", PUBLISHER_RUN_URL=URL):
+                    with patch("publisher.release_record", return_value=draft):
+                        with patch("publisher.revalidate"):
+                            p.publish_release(api, candidate, Path(tmp), False, "- Notes.")
+                calls = api.call.call_args_list
+                if existing_digest != digest:
+                    self.assertEqual(calls[0].args, (p.source_path("releases/assets/9"),))
+                    self.assertEqual(calls[0].kwargs, {"method": "DELETE"})
+                    self.assertEqual(calls[1].kwargs, {"raw": b"checksum data"})
+                self.assertEqual(calls[-2].args, (p.source_path("releases/5"),))
+                self.assertFalse(calls[-1].args[1]["draft"])
+
+        for change in ({"draft": False}, {"author": {"login": "attacker"}},
+                       {"target_commitish": OTHER}, {"tag_name": "v1.2.2"},
+                       {"body": "Unowned draft"}):
+            with self.subTest(change=change):
+                api = Mock()
+                with patch.dict(os.environ, APP_SLUG="publisher"):
+                    with patch("publisher.release_record", return_value=draft | change):
+                        with self.assertRaisesRegex(ValueError, "immutable"):
+                            p.publish(api, candidate, Path("not-even-downloaded"))
+                api.call.assert_not_called()
+                api.pages.assert_not_called()
+
+    def test_concurrent_publication_blocks_notes_update_and_finalization(self):
+        candidate = {"ref": "refs/tags/v1.2.3", "sha": SHA}
+        draft = {"id": 5, "draft": True, "author": {"login": "publisher[bot]"},
+                 "target_commitish": SHA, "tag_name": "v1.2.3",
+                 "body": "Built by the trusted [publisher](" + URL + ")."}
+        api = Mock()
+        api.pages.return_value = iter([])
+        api.call.return_value = draft | {"draft": False}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, APP_SLUG="publisher", PUBLISHER_RUN_URL=URL):
+                with patch("publisher.release_record", return_value=draft):
+                    with patch("publisher.revalidate"):
+                        with self.assertRaisesRegex(ValueError, "immutable"):
+                            p.publish_release(api, candidate, Path(tmp), False, "- Notes.")
+        api.call.assert_called_once_with(p.source_path("releases/5"))
+
+    def test_invalid_notes_block_all_publication_writes_including_draft_retry(self):
+        candidate = {"ref": "refs/tags/v1.2.3", "sha": SHA}
+        draft = {"id": 5, "draft": True, "author": {"login": "publisher[bot]"},
+                 "target_commitish": SHA, "tag_name": "v1.2.3",
+                 "body": "Built by the trusted [publisher](" + URL + ").\n\nOld notes."}
+        error = urllib.error.HTTPError("", 404, "Not Found", {}, None)
+        self.addCleanup(error.close)
+        for existing in (None, draft):
+            for content in ("## [Unreleased]\n- Future.", "## [1.2.3]\n\n", error):
+                with self.subTest(existing=existing, content=content):
+                    api = Mock()
+                    if isinstance(content, str):
+                        api.call.return_value = changelog_file(content)
+                    else:
+                        api.call.side_effect = content
+                    with patch.dict(os.environ, APP_SLUG="publisher"):
+                        with patch("publisher.release_record", return_value=existing):
+                            with patch("publisher.subprocess.run") as command:
+                                with self.assertRaises((ValueError, urllib.error.HTTPError)):
+                                    p.publish(api, candidate, Path("not-even-downloaded"))
+                    command.assert_not_called()
+                    api.call.assert_called_once_with(
+                        p.source_path("contents/CHANGELOG.md?ref=" + SHA))
 
     def test_fixed_destinations_and_latest_policy(self):
         for ref, current_latest, expected_tags, latest_release in (
@@ -557,7 +759,8 @@ class PublicationTests(unittest.TestCase):
                 self.assertEqual([call.args[0][-1] for call in command.call_args_list],
                                  ["docker://" + p.IMAGE + ":" + tag for tag in expected_tags])
                 if ref.startswith("refs/tags/"):
-                    self.assertEqual(release.call_args.args[-1], latest_release)
+                    self.assertEqual(release.call_args.args[-2], latest_release)
+                    self.assertEqual(release.call_args.args[-1], "- Fixes.")
                 else:
                     release.assert_not_called()
 
