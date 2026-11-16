@@ -69,9 +69,10 @@ this bootstrap. Keep `PUBLISHING_ENABLED` unset until completion.
    access for **both loom and loom-publisher**, including inherited repository
    access that grants Actions write. Repository default read-only workflow
    permissions alone are **not** sufficient: a branch workflow can request
-   `packages: write`. Verify neither repository's `GITHUB_TOKEN` can push a
-   disposable, non-production test tag before activation. Do not test by
-   overwriting production tags. Leave the package public/source-linked as desired
+   `packages: write`. Verify neither repository's `GITHUB_TOKEN` can start a blob
+   upload to the production package before activation; no image/tag needs to be
+   published. Cancel any unexpectedly authorized empty upload and stop cutover.
+   Do not test by overwriting production tags. Leave the package public/source-linked as desired
    but decouple inherited write access; remove old publication credentials.
 5. Create a classic package-publishing PAT owned by the package publishing
    identity, scoped to **write:packages** (implied read), without `repo`,
@@ -81,6 +82,11 @@ this bootstrap. Keep `PUBLISHING_ENABLED` unset until completion.
    expiry/rotation. Store it **only** as environment secret
    `production-publish/GHCR_PUBLISH_TOKEN`, never as a repository/org/source
    secret. Do not grant either repository automatic package write instead.
+   Run **Verify publishing credential** on publisher `main` to validate the
+   configured PAT's identity, package-only scopes, and actual package Write
+   access while `PUBLISHING_ENABLED` is still false. This workflow checks out
+   no source, starts and cancels an empty blob upload, and publishes no image,
+   tag, or package version. It is also suitable for verifying a rotated PAT.
 6. Create a GitHub App installed **only on Ebenderooock/loom** with:
    **Contents read/write**, **Commit statuses read/write**, **Actions read**,
    **Checks read** (authoritative push before/after metadata);
