@@ -1,10 +1,12 @@
 import contextlib
+import hashlib
 import io
 import json
 import pathlib
 import textwrap
 import unittest
 import urllib.error
+import urllib.parse
 from unittest import mock
 
 
@@ -43,7 +45,7 @@ class CredentialCheckTests(unittest.TestCase):
     def identity(self, owner="publisher", scopes="write:packages, read:packages"):
         return Response({"login": owner}, headers={"X-OAuth-Scopes": scopes})
 
-    def test_authorized_empty_upload_is_cancelled_without_publishing(self):
+    def test_authorized_zero_byte_probe_is_completed_without_publishing(self):
         for location, expected in [
             ("/v2/ebenderooock/loom/blobs/upload/19.test-session?state=test",
              "https://ghcr.io/v2/ebenderooock/loom/blobs/upload/19.test-session?state=test"),
@@ -57,15 +59,23 @@ class CredentialCheckTests(unittest.TestCase):
                     self.identity(),
                     Response({"token": "fake-registry-token"}),
                     Response(status=202, headers={"Location": location}),
-                    Response(status=204),
+                    Response(status=201),
                 ])
                 self.assertEqual(
                     [call.args[0].get_method() for call in requests],
-                    ["GET", "GET", "POST", "DELETE"],
+                    ["GET", "GET", "POST", "PUT"],
                 )
                 self.assertEqual(requests[2].args[0].data, b"")
-                self.assertEqual(requests[3].args[0].full_url, expected)
-                self.assertIn("Empty upload cancelled", output)
+                self.assertEqual(requests[3].args[0].data, b"")
+                actual = urllib.parse.urlsplit(requests[3].args[0].full_url)
+                expected = urllib.parse.urlsplit(expected)
+                self.assertEqual((actual.scheme, actual.netloc, actual.path),
+                                 (expected.scheme, expected.netloc, expected.path))
+                query = urllib.parse.parse_qs(actual.query)
+                self.assertEqual(query.pop("digest"),
+                                 ["sha256:" + hashlib.sha256(b"").hexdigest()])
+                self.assertEqual(query, urllib.parse.parse_qs(expected.query))
+                self.assertIn("Zero-byte probe blob completed", output)
                 self.assertNotIn("fake-secret", output)
                 self.assertNotIn("fake-registry-token", output)
 
@@ -90,8 +100,8 @@ class CredentialCheckTests(unittest.TestCase):
                 ),
             ])
 
-    def test_cancellation_cannot_forward_credentials_to_another_host(self):
-        with self.assertRaisesRegex(SystemExit, "unexpected cancellation URL"):
+    def test_completion_cannot_forward_credentials_to_another_host(self):
+        with self.assertRaisesRegex(SystemExit, "unexpected upload URL"):
             self.execute([
                 self.identity(),
                 Response({"token": "fake-registry-token"}),
@@ -100,8 +110,8 @@ class CredentialCheckTests(unittest.TestCase):
                 }),
             ])
 
-    def test_cancellation_failure_is_not_reported_as_success(self):
-        with self.assertRaisesRegex(SystemExit, "did not cancel"):
+    def test_completion_failure_is_not_reported_as_success(self):
+        with self.assertRaisesRegex(SystemExit, "did not complete"):
             self.execute([
                 self.identity(),
                 Response({"token": "fake-registry-token"}),
