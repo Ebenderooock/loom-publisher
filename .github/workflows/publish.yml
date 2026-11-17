@@ -1,6 +1,28 @@
 name: Trusted publisher
 
 on:
+  workflow_call:
+    inputs:
+      source_ref:
+        required: true
+        type: string
+      expected_source_sha:
+        required: true
+        type: string
+    secrets:
+      TVDB_APIKEY:
+        required: false
+      # Supplied only by this workflow's production-publish environment,
+      # never passed by the caller. Declared for workflow schema/linting.
+      LOOM_APP_PRIVATE_KEY:
+        required: false
+      GHCR_PUBLISH_TOKEN:
+        required: false
+    outputs:
+      candidate:
+        value: ${{ jobs.discover.outputs.candidate }}
+      publication_result:
+        value: ${{ jobs.publish.outputs.publication_result }}
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
@@ -14,6 +36,9 @@ on:
 permissions:
   contents: read
 
+env:
+  EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+
 # One control/build/publish transaction at a time, including manual runs.
 concurrency:
   group: production-publish
@@ -25,6 +50,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Reject untrusted reusable callers before environment access
+        run: python3 release_start.py publisher-guard
       - name: Fail closed before requesting environment credentials
         env:
           ENABLED: ${{ vars.PUBLISHING_ENABLED }}
@@ -54,6 +85,8 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Recheck trusted entry point before credentials, including reruns
+        run: python3 release_start.py publisher-guard
       - name: Require protected environment secrets
         env:
           APP_KEY: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
@@ -82,7 +115,9 @@ jobs:
           PUBLISHING_ENABLED: ${{ vars.PUBLISHING_ENABLED }}
           PUBLISHING_NOT_BEFORE: ${{ vars.PUBLISHING_NOT_BEFORE }}
           PUBLISHER_RUN_URL: https://github.com/Ebenderooock/loom-publisher/actions/runs/${{ github.run_id }}
-        run: python3 publisher.py discover
+        run: |
+          python3 release_start.py verify
+          python3 publisher.py discover
 
   build:
     needs: discover
@@ -138,11 +173,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production-publish
+    outputs:
+      publication_result: ${{ steps.publish.outputs.result }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Recheck trusted entry point before credentials, including reruns
+        run: python3 release_start.py publisher-guard
       - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         id: app
         with:
@@ -175,7 +214,11 @@ jobs:
           PUBLISHING_ENABLED: ${{ vars.PUBLISHING_ENABLED }}
           PUBLISHING_NOT_BEFORE: ${{ vars.PUBLISHING_NOT_BEFORE }}
           PUBLISHER_RUN_URL: https://github.com/Ebenderooock/loom-publisher/actions/runs/${{ github.run_id }}
-        run: python3 publisher.py publish
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          python3 release_start.py verify
+          python3 publisher.py publish
+          echo "result=success" >> "$GITHUB_OUTPUT"
       - name: Report build or publication failure on source
         if: always() && steps.app.outcome == 'success' && (needs.build.result != 'success' || steps.publish.outcome != 'success')
         env:

@@ -1,0 +1,163 @@
+name: Start release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Owner-approved version without v (for example 0.4.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: owner-release-start
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+  LOOM_APP_ID: ${{ vars.LOOM_APP_ID }}
+  PUBLISHING_ENABLED: ${{ vars.PUBLISHING_ENABLED }}
+  PUBLISHING_NOT_BEFORE: ${{ vars.PUBLISHING_NOT_BEFORE }}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate owner intent before environment access
+        run: python3 release_start.py guard
+
+  inspect:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production-publish
+    outputs:
+      snapshot: ${{ steps.inspect.outputs.snapshot }}
+      sha: ${{ steps.inspect.outputs.sha }}
+      source_ref: ${{ steps.inspect.outputs.source_ref }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Recheck owner on reruns before requesting a token
+        run: python3 release_start.py guard
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.LOOM_APP_ID }}
+          private-key: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
+          owner: Ebenderooock
+          repositories: loom
+          permission-actions: read
+          permission-contents: read
+      - name: Pin current source main, green push CI, and versioned changelog
+        id: inspect
+        env:
+          LOOM_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 release_start.py inspect
+
+  tag:
+    needs: inspect
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production-publish
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Recheck owner on reruns before requesting a token
+        run: python3 release_start.py guard
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.LOOM_APP_ID }}
+          private-key: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
+          owner: Ebenderooock
+          repositories: loom
+          permission-actions: read
+          permission-contents: write
+      - name: Revalidate and create annotated tag without updating existing refs
+        env:
+          LOOM_TOKEN: ${{ steps.app.outputs.token }}
+          SOURCE_SNAPSHOT: ${{ needs.inspect.outputs.snapshot }}
+        run: python3 release_start.py tag
+      # The token action revokes at job end, before the separate CI wait job.
+
+  tag-ci:
+    needs: [inspect, tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment: production-publish
+    outputs:
+      ci_url: ${{ steps.wait.outputs.ci_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Recheck owner on reruns before requesting a token
+        run: python3 release_start.py guard
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.LOOM_APP_ID }}
+          private-key: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
+          owner: Ebenderooock
+          repositories: loom
+          permission-actions: read
+          permission-contents: read
+      - name: Wait at most 30 minutes for exact latest tag push CI
+        id: wait
+        env:
+          LOOM_TOKEN: ${{ steps.app.outputs.token }}
+          EXPECTED_SOURCE_SHA: ${{ needs.inspect.outputs.sha }}
+        run: python3 release_start.py wait
+
+  publisher:
+    needs: [inspect, tag-ci]
+    uses: ./.github/workflows/publish.yml
+    with:
+      source_ref: ${{ needs.inspect.outputs.source_ref }}
+      expected_source_sha: ${{ needs.inspect.outputs.sha }}
+    secrets:
+      TVDB_APIKEY: ${{ secrets.TVDB_APIKEY }}
+
+  completion:
+    needs: [inspect, tag-ci, publisher]
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report only completed publication
+        env:
+          PUBLICATION_RESULT: ${{ needs.publisher.outputs.publication_result }}
+          CANDIDATE: ${{ needs.publisher.outputs.candidate }}
+          SOURCE_REF: ${{ needs.inspect.outputs.source_ref }}
+          EXPECTED_SOURCE_SHA: ${{ needs.inspect.outputs.sha }}
+          CI_URL: ${{ needs.tag-ci.outputs.ci_url }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          candidate = json.loads(os.environ["CANDIDATE"] or "{}")
+          if (os.environ["PUBLICATION_RESULT"] != "success"
+                  or candidate.get("ref") != os.environ["SOURCE_REF"]
+                  or candidate.get("sha") != os.environ["EXPECTED_SOURCE_SHA"]):
+              raise SystemExit("No completed matching publication; inspect Trusted publisher jobs")
+          version = os.environ["VERSION"]
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+              summary.write(f"Published Loom v{version} at `{candidate['sha']}`.\n\n"
+                            f"- [Release and assets](https://github.com/Ebenderooock/loom/releases/tag/v{version})\n"
+                            f"- [Tag push CI]({os.environ['CI_URL']})\n"
+                            "- [Container package](https://github.com/Ebenderooock/loom/pkgs/container/loom)\n"
+                            f"- Image: `ghcr.io/ebenderooock/loom:{version.replace('+', '_')}`\n")
+          PY

@@ -7,9 +7,12 @@ This checkout contains no credentials; bootstrap does not publish anything.
 
 ## Trust boundary
 
-`publish.yml` polls source CI every five minutes (GitHub may delay schedules)
-or accepts an optional `workflow_dispatch` input `source_ref`. Only publisher
-`refs/heads/main` can proceed. It selects **one** eligible current tip per run:
+`publish.yml` polls source CI every five minutes (GitHub may delay schedules),
+accepts an optional `workflow_dispatch` input `source_ref`, or is called locally
+by the owner-only **Start release** workflow described below. Only the actual
+publisher repository on `refs/heads/main` can proceed; reusable callers are
+restricted to these two protected-main workflow files, not forks or arbitrary
+workflows. It selects **one** eligible current tip per run:
 
 - `refs/heads/main`
 - `refs/heads/prelease/X.Y.Z` and `refs/heads/prerelease/X.Y.Z` (strict numeric
@@ -92,17 +95,27 @@ this bootstrap. Keep `PUBLISHING_ENABLED` unset until completion.
    an authorization check, not an end-to-end publication test. Verify actual
    publication separately through the normal publisher workflow. The check is
    also suitable for verifying a rotated PAT.
-6. Create a GitHub App installed **only on Ebenderooock/loom** with:
+6. Use the existing **loom-publisher** GitHub App, ID **5789004**, installed
+   **only on Ebenderooock/loom**, with:
    **Contents read/write**, **Commit statuses read/write**, **Actions read**,
    **Checks read** (authoritative push before/after metadata);
    no workflows permission, no publisher installation, no webhook needed.
    Store its private key **only** as environment secret
    `production-publish/LOOM_APP_PRIVATE_KEY`.
+   For owner-initiated releases, give **only this App** an **Always** bypass on
+   source **release-tag creation ruleset 27398035**. This is a one-time App
+   exception to creation restrictions, not a per-version exclusion. Keep tag
+   patterns broad enough to protect every release (`v*`); do not exclude
+   `v0.4.2` or future tags. Leave **immutable-tags ruleset 27398036** and protected
+   source branches unchanged, with **no App bypass on tag immutability**.
+   The App must be able to create a tag, never update/delete an existing tag.
+   No App installation/permission change, owner/PAT bypass, source credential,
+   or Cloudflare dispatcher credential is required.
 7. Set publisher **repository variables**:
 
    | Variable | Value |
    |---|---|
-   | `LOOM_APP_ID` | App numeric ID |
+   | `LOOM_APP_ID` | `5789004` (existing source-only App) |
    | `GHCR_PUBLISH_USERNAME` | PAT owner's actual GitHub login; never `github.actor` |
    | `PUBLISHING_NOT_BEFORE` | Deliberate CI creation-time floor, UTC `YYYY-MM-DDTHH:MM:SSZ` |
    | `PUBLISHING_ENABLED` | Set to literal `true` **last**, after the steps below |
@@ -130,6 +143,76 @@ Unset/false activation skips scheduled work; manual requests fail clearly until
 fully configured. Missing App/PAT/variables fail enabled jobs. Environment
 protection must exist before secrets are added. Setting the switch alone is
 not a security boundary against an unprotected publisher branch.
+
+## Owner version button: Start release
+
+After the reviewed workflow is integrated on publisher **main** and the one-time
+creation-ruleset App bypass above is configured, the repository owner
+**Ebenderooock** opens this repository's **Actions > Start release > Run workflow**,
+selects **main**, and enters a version **without `v`**, for example **`0.4.2`**.
+Do not push a local tag first: the workflow creates the canonical annotated
+remote tag through the GitHub API. Strict semver, prerelease/build metadata, and
+the publisher's existing 110-character limit apply.
+
+Only explicit owner dispatch is accepted: publisher repository/owner numeric
+IDs, actor ID, original event sender, triggering actor on reruns, workflow path,
+main ref, activation switch and App ID are checked before token minting.
+An Actions-write dispatcher App cannot start this workflow or rerun an owner's
+run to create tags; an owner rerun cannot legitimize an original App dispatch.
+The same checks run again before each new privileged job's token request,
+including on failed-job reruns. This introduces **no owner restriction on the
+existing non-tag-creating publisher schedule/manual interface**.
+
+The workflow:
+
+1. Pins the **current source main SHA**, using repository ID **1230254566**,
+   the latest successful authoritative **push** CI run/attempt, the activation
+   baseline, and exactly one non-empty versioned changelog section at that SHA.
+2. Revalidates that exact main/CI snapshot and changelog immediately before
+   creating `refs/tags/v<version>`. Only this short tagger job requests Contents
+   write; inspection and CI waiting use Contents/Actions read. Each source-scoped
+   App token is revoked by the pinned token action at job end; the write token
+   is gone before waiting for CI. Existing publishing jobs retain their required
+   release/status write permissions.
+3. Waits up to **30 minutes** (35-minute job ceiling, including API overhead)
+   for that exact tag/SHA's latest source **push** CI, pinned to workflow
+   **271638826**, `.github/workflows/ci.yml`. PR/dispatch CI, an older success,
+   pending attempts and failed reruns cannot authorize release. Logs include
+   actionable CI URLs; failure/timeout preserves the tag.
+4. Calls the existing `publish.yml` synchronously with the full tag ref and
+   pinned SHA. Both before discovery and before publication it checks current
+   main, latest green main/tag push CI, the annotated tag and tagged changelog
+   again. Existing publisher ref/CI revalidation, isolated builds, asset
+   validation, immutable-release handling and GHCR credentials remain intact;
+   `publisher.py` policy is unchanged.
+5. Reports success with release/assets, CI, container package and image links
+   **only after the actual trusted publishing step completes**, not after
+   dispatch/queue acceptance. Expand the nested publisher jobs for failures.
+
+Secret-bearing jobs use only the main-only **production-publish** environment.
+Control runners check out only publisher code, never source code or source build
+scripts. The reusable call passes only the existing optional build key
+`TVDB_APIKEY`; App and GHCR secrets resolve in the callee's protected environment.
+There is no cross-workflow dispatch token, webhook, paid service, or dependency on
+Cloudflare: **Cloudflare does not need to change to release Loom**.
+
+For CI failure or timeout, inspect the linked source run, rerun source **push**
+CI if necessary, then rerun Start release as owner with the same version.
+An existing annotated tag is reusable only when its direct commit target, tag
+name and canonical release-start annotation match; lightweight/conflicting tags
+are rejected, never forced/deleted. Annotation matching is not a cryptographic
+signature: provenance relies on the sole-App creation bypass and immutable-tag
+ruleset. A failed ref creation may leave an unreachable annotated Git object.
+
+This button intentionally fails closed if source main advances before publication.
+Keep main at the approved SHA until completion; if it has advanced, do not move
+the tag to repair it. Investigate and use the existing explicit full-ref publisher
+recovery path for the already-tagged commit after owner review, or choose a new
+version. The unchanged scheduled publisher can also observe a green tag and
+publish it first; transactions serialize under `production-publish`. In that
+case Start release rejects the already-public release rather than claiming its
+own completion or overwriting anything; inspect the source release and publisher
+run. Public releases are never reopened/overwritten, even on owner reruns.
 
 ## Publication interface and outputs
 
@@ -263,7 +346,7 @@ Requires Python 3.12+ (standard `ubuntu-latest` includes it) and Go for actionli
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 -m py_compile publisher.py build.py tests/test_publisher.py
+python3 -m py_compile publisher.py build.py release_start.py tests/test_*.py
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= .github/workflows/*.yml
 ```
 
