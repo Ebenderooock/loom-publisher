@@ -174,8 +174,10 @@ The workflow:
    older success. Source main movement or invalid CI identity fails closed,
    never silently repinning. The activation baseline and exactly one non-empty
    versioned changelog section at that SHA are also required.
-2. Revalidates that exact main/CI snapshot and changelog immediately before
-   creating `refs/tags/v<version>`. Only this short tagger job requests Contents
+2. Checks that both protected environment credentials are non-empty before
+   requesting the tagger token, including on failed-job reruns. Revalidates that
+   exact main/CI snapshot and changelog immediately before creating
+   `refs/tags/v<version>`. Only this short tagger job requests Contents
    write; inspection and CI waiting use Contents/Actions read. Each source-scoped
    App token is revoked by the pinned token action at job end; the write token
    is gone before waiting for CI. Existing publishing jobs retain their required
@@ -197,8 +199,17 @@ The workflow:
 
 Secret-bearing jobs use only the main-only **production-publish** environment.
 Control runners check out only publisher code, never source code or source build
-scripts. The reusable call passes only the existing optional build key
-`TVDB_APIKEY`; App and GHCR secrets resolve in the callee's protected environment.
+scripts. The reusable call explicitly maps the existing optional build key
+`TVDB_APIKEY` and the required names `LOOM_APP_PRIVATE_KEY` and
+`GHCR_PUBLISH_TOKEN`. GitHub requires callers to pass environment-secret names
+even when those secrets exist only in the callee's environment; otherwise they
+resolve empty ([reusable workflow secret rules](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-inputs-and-secrets-in-a-reusable-workflow)).
+App and GHCR values still resolve only in jobs selecting **production-publish**;
+do not copy them to repository secrets or use blanket `secrets: inherit`.
+The source build job has no environment and references neither credential.
+The reusable contract requires both names, and discovery rechecks their values.
+The pre-tag check detects missing values, not PAT expiry, scopes or package
+authorization; it does not publish or replace **Verify publishing credential**.
 There is no cross-workflow dispatch token, webhook, paid service, or dependency on
 Cloudflare: **Cloudflare does not need to change to release Loom**.
 

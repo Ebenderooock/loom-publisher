@@ -12,12 +12,12 @@ on:
     secrets:
       TVDB_APIKEY:
         required: false
-      # Supplied only by this workflow's production-publish environment,
-      # never passed by the caller. Declared for workflow schema/linting.
+      # Callers must map these names; values resolve only in jobs selecting
+      # production-publish. Required checks wiring, not non-empty values.
       LOOM_APP_PRIVATE_KEY:
-        required: false
+        required: true
       GHCR_PUBLISH_TOKEN:
-        required: false
+        required: true
     outputs:
       candidate:
         value: ${{ jobs.discover.outputs.candidate }}

@@ -76,6 +76,14 @@ jobs:
           persist-credentials: false
       - name: Recheck owner on reruns before requesting a token
         run: python3 release_start.py guard
+      - name: Require protected environment secrets
+        env:
+          APP_KEY: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
+          PACKAGE_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$APP_KEY" || { echo "::error::production-publish LOOM_APP_PRIVATE_KEY missing"; exit 1; }
+          test -n "$PACKAGE_TOKEN" || { echo "::error::production-publish GHCR_PUBLISH_TOKEN missing"; exit 1; }
       - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         id: app
         with:
@@ -130,6 +138,9 @@ jobs:
       expected_source_sha: ${{ needs.inspect.outputs.sha }}
     secrets:
       TVDB_APIKEY: ${{ secrets.TVDB_APIKEY }}
+      # Explicit names are required even for callee environment-only secrets.
+      LOOM_APP_PRIVATE_KEY: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
+      GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
 
   completion:
     needs: [inspect, tag-ci, publisher]
