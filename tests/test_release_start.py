@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -555,8 +556,62 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertIn("permission-contents: " + ("write" if name == "tag" else "read"), job)
             self.assertNotIn("repository: Ebenderooock/loom", job)
             for forbidden in ("permission-statuses", "permission-checks", "packages: write",
-                              "skip-token-revoke", "GHCR_PUBLISH_TOKEN", "build.py"):
+                              "skip-token-revoke", "build.py"):
                 self.assertNotIn(forbidden, job)
+            if name != "tag":
+                self.assertNotIn("GHCR_PUBLISH_TOKEN", job)
+
+    def test_reusable_caller_explicitly_maps_required_environment_secret_names(self):
+        caller = self.start.split("\n  publisher:\n", 1)[1].split("\n  completion:\n", 1)[0]
+        mappings = dict(re.findall(r"^      (\w+): \$\{\{ secrets\.(\w+) \}\}$",
+                                   caller, re.MULTILINE))
+        self.assertEqual(mappings, {
+            "TVDB_APIKEY": "TVDB_APIKEY",
+            "LOOM_APP_PRIVATE_KEY": "LOOM_APP_PRIVATE_KEY",
+            "GHCR_PUBLISH_TOKEN": "GHCR_PUBLISH_TOKEN",
+        })
+        contract = self.publish.split("    secrets:\n", 1)[1].split("    outputs:\n", 1)[0]
+        for name in ("LOOM_APP_PRIVATE_KEY", "GHCR_PUBLISH_TOKEN"):
+            self.assertRegex(contract, rf"      {name}:\n        required: true")
+        self.assertIn("      TVDB_APIKEY:\n        required: false", contract)
+        self.assertNotIn("secrets: inherit", self.start + self.publish)
+
+    def test_credential_readiness_blocks_tagging_and_is_rechecked_before_discovery(self):
+        tag = self.start.split("\n  tag:\n", 1)[1].split("\n  tag-ci:\n", 1)[0]
+        self.assertIn("    needs: inspect\n", tag)
+        self.assertNotIn("    if:", tag)
+        discover = self.publish.split("\n  discover:\n", 1)[1].split("\n  build:\n", 1)[0]
+        self.assertLess(tag.index("Require protected environment secrets"),
+                        tag.index("python3 release_start.py tag"))
+        for job, guard in ((tag, "release_start.py guard"),
+                           (discover, "release_start.py publisher-guard")):
+            with self.subTest(guard=guard):
+                marker = "      - name: Require protected environment secrets\n"
+                self.assertIn("    environment: production-publish\n", job)
+                self.assertIn(marker, job)
+                self.assertLess(job.index(guard), job.index(marker))
+                self.assertLess(job.index(marker), job.index("actions/create-github-app-token@"))
+                step = job.split(marker, 1)[1].split("\n      - ", 1)[0]
+                self.assertIn("APP_KEY: ${{ secrets.LOOM_APP_PRIVATE_KEY }}", step)
+                self.assertIn("PACKAGE_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}", step)
+                script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+                for key, token, missing in (
+                    ("", "sentinel-pat", "LOOM_APP_PRIVATE_KEY"),
+                    ("sentinel-key", "", "GHCR_PUBLISH_TOKEN"),
+                    ("", "", "LOOM_APP_PRIVATE_KEY"),
+                    ("sentinel-key", "sentinel-pat", None),
+                ):
+                    result = subprocess.run(
+                        ["/bin/bash", "-c", script],
+                        env={"APP_KEY": key, "PACKAGE_TOKEN": token},
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 1 if missing else 0)
+                    output = result.stdout + result.stderr
+                    if missing:
+                        self.assertIn(f"production-publish {missing} missing", output)
+                    self.assertNotIn("sentinel-key", output)
+                    self.assertNotIn("sentinel-pat", output)
 
     def test_main_ci_wait_has_job_headroom(self):
         inspect = self.start.split("\n  inspect:\n", 1)[1].split("\n  tag:\n", 1)[0]
