@@ -63,13 +63,104 @@ def release_ref(value):
     return "refs/tags/v" + value
 
 
-def source_snapshot(api, ref, expected=None):
-    p.ref_policy(ref)
-    p.require(ref.startswith("refs/tags/v"), "Release start requires a version tag")
+def source_identity(api):
     repository = api.call("/repos/" + p.SOURCE + "?")
     p.require(repository.get("id") == SOURCE_ID
               and repository.get("default_branch") == "main",
               "Source repository identity/default branch changed")
+
+
+def main_tip(api):
+    source_identity(api)
+    result = api.call(p.source_path("git/ref/heads/main"))
+    obj = result.get("object") or {}
+    p.require(result.get("ref") == MAIN and obj.get("type") == "commit"
+              and p.SHA.fullmatch(obj.get("sha", "")),
+              "Invalid source main ref/commit identity")
+    return obj["sha"]
+
+
+def readiness_report(message, summary=False):
+    print(message, flush=True)
+    if summary and os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
+            stream.write(message + "\n\n")
+
+
+def wait_main_ci(api, timeout=1800, interval=20):
+    started = time.monotonic()
+    deadline = started + timeout
+    sha = main_tip(api)
+    workflow_url = f"https://github.com/{p.SOURCE}/actions/workflows/ci.yml"
+    last = workflow_url
+    observed = (0, 0)
+    recovery = ("Inspect source push CI, then rerun Start release as owner with the same "
+                "version once CI passes. No tag was created by this inspection.")
+    readiness_report(f"Pinned {MAIN} at `{sha}`; waiting up to {timeout}s for authoritative "
+                     f"push CI: {workflow_url}", summary=True)
+    while True:
+        p.require(main_tip(api) == sha,
+                  f"Source main moved from pinned {sha}; refusing to repin. "
+                  f"Review current main before retrying: {last}")
+        p.validate_workflow(api)
+        runs = [run for run in api.pages(p.source_path(
+            f"actions/workflows/{p.CI_ID}/runs?event=push&head_sha={sha}"), "workflow_runs")
+                if run.get("head_branch") == p.short_ref(MAIN)]
+        state = "missing (no main push CI run yet)"
+        run = None
+        if runs:
+            # Validate identity independently of readiness, including pending list/detail data.
+            for item in runs:
+                p.require(p.valid_ci(item | {"status": "completed", "conclusion": "success"},
+                                     MAIN, sha),
+                          f"Invalid main push CI identity metadata: {workflow_url}")
+            latest = max(runs, key=lambda item: (item["id"], item["run_attempt"]))
+            last = f"https://github.com/{p.SOURCE}/actions/runs/{latest['id']}"
+            run = api.call(p.source_path(f"actions/runs/{latest['id']}"))
+            p.require(p.valid_ci(run | {"status": "completed", "conclusion": "success"}, MAIN, sha)
+                      and run["id"] == latest["id"]
+                      and run["run_attempt"] >= latest["run_attempt"],
+                      f"Invalid main push CI run/attempt identity metadata: {last}")
+            identity = (run["id"], run["run_attempt"])
+            p.require(identity >= observed,
+                      f"Main push CI run/attempt regressed from {observed}: {last}")
+            observed = identity
+            status = run.get("status")
+            p.require(status in ("queued", "in_progress", "pending", "requested",
+                                 "waiting", "action_required", "completed"),
+                      f"Invalid main push CI status metadata: {last}")
+            state = f"{status}, attempt {run['run_attempt']}"
+            if status == "completed":
+                state += f", conclusion {run.get('conclusion')}"
+        elapsed = time.monotonic() - started
+        readiness_report(f"Main push CI: {state}; elapsed {elapsed:.0f}s/{timeout}s; "
+                         f"{MAIN} at {sha}: {last}")
+        p.require(main_tip(api) == sha,
+                  f"Source main moved from pinned {sha}; refusing to repin: {last}")
+        if run and run["status"] == "completed" and run.get("conclusion") != "success":
+            message = f"Latest main push CI completed without success ({state}): {last}. {recovery}"
+            readiness_report(message, summary=True)
+            raise ValueError(message)
+        if time.monotonic() >= deadline:
+            message = f"Timed out waiting for main push CI ({state}): {last}. {recovery}"
+            readiness_report(message, summary=True)
+            raise ValueError(message)
+        if run and p.valid_ci(run, MAIN, sha):
+            candidate = p.authorize(api, MAIN)
+            p.require(candidate["sha"] == sha and candidate["ci_id"] == run["id"]
+                      and candidate["ci_attempt"] == run["run_attempt"],
+                      f"Source main/CI changed during readiness authorization: {last}")
+            p.baseline_check(candidate)
+            readiness_report(f"Main push CI ready after {elapsed:.0f}s at `{sha}`: {last}",
+                             summary=True)
+            return candidate
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+
+
+def source_snapshot(api, ref, expected=None):
+    p.ref_policy(ref)
+    p.require(ref.startswith("refs/tags/v"), "Release start requires a version tag")
+    source_identity(api)
     candidate = p.authorize(api, MAIN)
     p.baseline_check(candidate)
     if expected is not None:
@@ -208,7 +299,7 @@ def main():
         return
     api = p.API()
     if command == "inspect":
-        snapshot = source_snapshot(api, ref)
+        snapshot = source_snapshot(api, ref, wait_main_ci(api))
         # Reject conflicts before requesting a contents-write token.
         matching_tag(api, ref, snapshot["sha"])
         output("snapshot", json.dumps(snapshot, separators=(",", ":")))

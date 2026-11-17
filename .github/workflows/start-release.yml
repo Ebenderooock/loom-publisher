@@ -36,7 +36,7 @@ jobs:
   inspect:
     needs: preflight
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 35
     environment: production-publish
     outputs:
       snapshot: ${{ steps.inspect.outputs.snapshot }}
@@ -58,7 +58,7 @@ jobs:
           repositories: loom
           permission-actions: read
           permission-contents: read
-      - name: Pin current source main, green push CI, and versioned changelog
+      - name: Pin source main and wait at most 30 minutes for its push CI
         id: inspect
         env:
           LOOM_TOKEN: ${{ steps.app.outputs.token }}
