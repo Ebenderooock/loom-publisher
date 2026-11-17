@@ -166,8 +166,14 @@ existing non-tag-creating publisher schedule/manual interface**.
 The workflow:
 
 1. Pins the **current source main SHA**, using repository ID **1230254566**,
-   the latest successful authoritative **push** CI run/attempt, the activation
-   baseline, and exactly one non-empty versioned changelog section at that SHA.
+   then waits up to **30 minutes** for its latest authoritative **push** CI
+   run/attempt (35-minute inspection job ceiling, including API overhead).
+   Logs show missing/queued/pending/running CI, elapsed time and canonical CI
+   links; the job summary records the pin and readiness or failure/timeout.
+   A completed unsuccessful run fails immediately; a newer rerun supersedes
+   older success. Source main movement or invalid CI identity fails closed,
+   never silently repinning. The activation baseline and exactly one non-empty
+   versioned changelog section at that SHA are also required.
 2. Revalidates that exact main/CI snapshot and changelog immediately before
    creating `refs/tags/v<version>`. Only this short tagger job requests Contents
    write; inspection and CI waiting use Contents/Actions read. Each source-scoped
@@ -196,8 +202,14 @@ scripts. The reusable call passes only the existing optional build key
 There is no cross-workflow dispatch token, webhook, paid service, or dependency on
 Cloudflare: **Cloudflare does not need to change to release Loom**.
 
-For CI failure or timeout, inspect the linked source run, rerun source **push**
-CI if necessary, then rerun Start release as owner with the same version.
+For main-CI failure or timeout during inspection, no tag has been created by
+that inspection and no new version is needed. Inspect the linked source run
+(or workflow page if startup is missing), rerun source **push** CI if necessary,
+then rerun Start release as owner with the same version once prerequisites pass.
+The new inspection pins current main again; review it if main has advanced.
+Tag creation and publication do not wait or retry writes: their existing
+immediate main/CI rechecks must still pass.
+For tag-CI failure or timeout, use the same CI recovery and owner rerun.
 An existing annotated tag is reusable only when its direct commit target, tag
 name and canonical release-start annotation match; lightweight/conflicting tags
 are rejected, never forced/deleted. Annotation matching is not a cryptographic

@@ -1,3 +1,4 @@
+import io
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,8 @@ class ReleaseAPI(FakeAPI):
         endpoint = path.removeprefix(p.source_path(""))
         if path == "/repos/" + p.SOURCE + "?":
             return self.repository
+        if endpoint == "git/ref/heads/main":
+            return {"ref": r.MAIN, "object": {"type": "commit", "sha": self.tip}}
         if endpoint == "git/ref/tags/v0.4.2":
             if self.ref_error:
                 raise self.ref_error
@@ -206,14 +209,163 @@ class ReleaseStartTests(unittest.TestCase):
 
     def test_cli_inspection_emits_exact_snapshot_and_ref_for_reusable_pipeline(self):
         with patch("sys.argv", ["release_start.py", "inspect"]), patch(
-                "release_start.p.API", return_value=self.api):
+                "release_start.p.API", return_value=self.api), patch(
+                "release_start.wait_main_ci", wraps=r.wait_main_ci) as waiting:
             r.main()
+        waiting.assert_called_once_with(self.api)
         outputs = dict(line.split("=", 1) for line in
                        Path(os.environ["GITHUB_OUTPUT"]).read_text().splitlines())
         self.assertEqual(outputs["source_ref"], REF)
         self.assertEqual(outputs["sha"], SHA)
         self.assertEqual(json.loads(outputs["snapshot"]), p.authorize(self.api, r.MAIN))
         self.assertEqual(self.api.writes, [])
+
+    def wait_main(self, api=None, on_sleep=None, timeout=31):
+        clock = [0.0]
+        self.sleeps = []
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            clock[0] += seconds
+            if on_sleep:
+                on_sleep()
+
+        with patch("release_start.time.monotonic", side_effect=lambda: clock[0]), patch(
+                "release_start.time.sleep", side_effect=sleep):
+            return r.wait_main_ci(api or self.api, timeout=timeout, interval=20)
+
+    def test_main_inspection_waits_for_pinned_ci_and_reports_progress_and_summary(self):
+        summary = Path(self.temporary.name) / "summary"
+        for status in ("missing", "queued", "pending", "in_progress"):
+            api = ReleaseAPI()
+            api.runs = [] if status == "missing" else [run(status=status, conclusion=None)]
+
+            def complete():
+                api.runs = [run()]
+
+            with self.subTest(status=status), patch.dict(
+                    os.environ, GITHUB_STEP_SUMMARY=str(summary)), patch(
+                    "sys.stdout", new_callable=io.StringIO) as log:
+                candidate = self.wait_main(api, complete)
+                self.assertEqual(candidate, p.authorize(api, r.MAIN))
+                self.assertEqual(self.sleeps, [20])
+                self.assertIn(f"Main push CI: {status}", log.getvalue())
+                self.assertIn("elapsed 20s/31s", log.getvalue())
+                self.assertIn("/actions/runs/100", log.getvalue())
+                self.assertIn(SHA, summary.read_text())
+                self.assertIn("ready after 20s", summary.read_text())
+                self.assertEqual(api.writes, [])
+
+    def test_main_completed_failure_is_immediate_actionable_and_not_a_timeout(self):
+        for conclusion in ("failure", "cancelled", "skipped", None):
+            api = ReleaseAPI()
+            api.runs[0]["conclusion"] = conclusion
+            with self.subTest(conclusion=conclusion), self.assertRaisesRegex(
+                    ValueError, "completed without success.*actions/runs/100.*same version"):
+                self.wait_main(api)
+            self.assertEqual(self.sleeps, [])
+            self.assertEqual(api.writes, [])
+
+    def test_main_missing_or_running_timeout_is_bounded_and_no_tag_is_created(self):
+        for status in ("missing", "queued", "in_progress"):
+            api = ReleaseAPI()
+            api.runs = [] if status == "missing" else [
+                run(status=status, conclusion=None)]
+            link = "actions/workflows/ci.yml" if status == "missing" else "actions/runs/100"
+            with self.subTest(status=status), self.assertRaisesRegex(
+                    ValueError, f"Timed out.*{status}.*{link}.*No tag was created"):
+                self.wait_main(api)
+            self.assertEqual(self.sleeps, [20, 11])
+            self.assertEqual(api.writes, [])
+
+    def test_main_wait_rejects_movement_instead_of_repinning_to_green_ci(self):
+        self.api.runs[0].update(status="in_progress", conclusion=None)
+
+        def move():
+            self.api.tip = OTHER
+            self.api.runs[0].update(head_sha=OTHER, status="completed", conclusion="success")
+
+        with self.assertRaisesRegex(ValueError, "main moved.*refusing to repin"):
+            self.wait_main(on_sleep=move)
+        self.assertEqual(self.api.writes, [])
+
+    def test_main_wait_never_accepts_an_observed_attempt_regression(self):
+        self.api.runs = [run(run_attempt=3, status="in_progress", conclusion=None)]
+
+        def stale_success():
+            self.api.runs = [run(run_attempt=2)]
+
+        with self.assertRaisesRegex(ValueError, "attempt regressed.*actions/runs/100"):
+            self.wait_main(on_sleep=stale_success)
+        self.assertEqual(self.api.writes, [])
+
+    def test_main_wait_rejects_untrusted_list_and_detail_even_while_running(self):
+        for location in ("list", "detail"):
+            for change in (
+                {"workflow_id": 42}, {"path": "evil.yml"}, {"event": "workflow_dispatch"},
+                {"head_sha": OTHER}, {"head_repository": {"full_name": "evil/loom"}},
+                {"run_attempt": 0}, {"check_suite_id": 0}, {"id": "100"},
+            ):
+                api = ReleaseAPI()
+                api.runs = [run(status="in_progress", conclusion=None)]
+                original_call = api.call
+                if location == "list":
+                    # Return invalid metadata despite the API's push/SHA query filters.
+                    api.pages = lambda *_: iter([api.runs[0] | change])
+                else:
+                    def detail(path, *args, **kwargs):
+                        result = original_call(path, *args, **kwargs)
+                        return result | change if "/actions/runs/" in path else result
+                    api.call = detail
+                with self.subTest(location=location, change=change), self.assertRaisesRegex(
+                        ValueError, "identity metadata.*https://github.com/"):
+                    self.wait_main(api)
+                self.assertEqual(self.sleeps, [])
+                self.assertEqual(api.writes, [])
+
+    def test_main_wait_uses_latest_run_and_detail_attempt_not_stale_success(self):
+        for latest in (
+            run(id=101, status="in_progress", conclusion=None),
+            run(id=100, run_attempt=3, status="in_progress", conclusion=None),
+            run(id=101, conclusion="failure"),
+            run(id=100, run_attempt=3, conclusion="failure"),
+        ):
+            api = ReleaseAPI()
+            api.runs.append(latest)
+            original = api.pages
+            # A rerun may already be visible in detail before the list refreshes.
+            if latest["id"] == 100:
+                api.pages = lambda *args: iter(list(original(*args))[:1])
+            expected = "Timed out" if latest["status"] == "in_progress" else "without success"
+            with self.subTest(latest=latest), self.assertRaisesRegex(
+                    ValueError, expected + ".*actions/runs/10"):
+                self.wait_main(api)
+            self.assertEqual(api.writes, [])
+
+    def test_main_wait_rechecks_authorization_and_rejects_invalid_ref_identity(self):
+        for change in ({"ref": "refs/heads/evil"},
+                       {"object": {"type": "tag", "sha": SHA}}):
+            original = self.api.call
+
+            def detail(path, *args, **kwargs):
+                result = original(path, *args, **kwargs)
+                return result | change if path.endswith("git/ref/heads/main") else result
+
+            with self.subTest(change=change), patch.object(self.api, "call", side_effect=detail):
+                with self.assertRaisesRegex(ValueError, "main ref/commit identity"):
+                    self.wait_main()
+        newer = p.authorize(self.api, r.MAIN) | {"ci_attempt": 3}
+        with patch("release_start.p.authorize", return_value=newer):
+            with self.assertRaisesRegex(ValueError, "changed during readiness authorization"):
+                self.wait_main()
+        self.assertEqual(self.api.writes, [])
+
+    def test_tag_and_publication_rechecks_never_wait(self):
+        with patch("release_start.wait_main_ci", side_effect=AssertionError("must not wait")):
+            snapshot = r.source_snapshot(self.api, REF)
+            r.create_tag(self.api, REF, snapshot)
+            with patch.dict(os.environ, EXPECTED_SOURCE_SHA=SHA, SOURCE_REF=REF):
+                r.verify_publication_input(self.api)
 
     def test_matching_immutable_annotated_tag_resumes_without_writes(self):
         self.api.install_tag()
@@ -405,6 +557,10 @@ class WorkflowPolicyTests(unittest.TestCase):
             for forbidden in ("permission-statuses", "permission-checks", "packages: write",
                               "skip-token-revoke", "GHCR_PUBLISH_TOKEN", "build.py"):
                 self.assertNotIn(forbidden, job)
+
+    def test_main_ci_wait_has_job_headroom(self):
+        inspect = self.start.split("\n  inspect:\n", 1)[1].split("\n  tag:\n", 1)[0]
+        self.assertIn("timeout-minutes: 35", inspect)
 
     def test_reusable_pipeline_guards_and_actual_completion_not_dispatch(self):
         self.assertIn("workflow_call:", self.publish)
