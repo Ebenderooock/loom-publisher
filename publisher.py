@@ -318,7 +318,10 @@ def set_status(api, candidate, state):
 
 
 def status_description(candidate, state):
-    return f"Trusted publisher: {state} (CI {candidate['ci_id']}/{candidate['ci_attempt']})"
+    description = f"Trusted publisher: {state} (CI {candidate['ci_id']}/{candidate['ci_attempt']})"
+    if state == "success" and ref_policy(candidate["ref"])[0] in ("prelease", "prerelease"):
+        description += " native-v1"
+    return description
 
 
 def discover(api, explicit):
@@ -351,7 +354,10 @@ def discover(api, explicit):
             print(f"Not eligible: {ref}: {exc}")
             continue
         statuses = list(api.pages(source_path("commits/" + candidate["sha"] + "/statuses")))
-        if trusted_success(statuses, ref, slug):
+        success = trusted_status(statuses, ref, slug)
+        if (success and success.get("state") == "success"
+                and (ref_policy(ref)[0] not in ("prelease", "prerelease")
+                     or (success.get("description") or "").endswith(" native-v1"))):
             if explicit:
                 print("Already published")
             continue
@@ -408,7 +414,10 @@ def native_update_source(candidate):
         require(pre is None,
                 "Tagged prereleases cannot satisfy branch-bound native Prelease contract")
         return "stable", value
-    return "prelease", value
+    require(type(candidate.get("ci_id")) is int and candidate["ci_id"] > 0
+            and type(candidate.get("ci_attempt")) is int and candidate["ci_attempt"] > 0,
+            "Invalid source CI identity")
+    return "prelease", f"{value}-pre.{candidate['ci_id']}.{candidate['ci_attempt']}"
 
 
 def update_manifest(candidate, digests):
@@ -702,6 +711,149 @@ def publish_release(api, candidate, directory, advance, notes):
     }, method="PATCH")
 
 
+def prelease_retention():
+    value = os.environ.get("PRELEASE_RETENTION", "") or "3"
+    require(re.fullmatch(r"[1-9][0-9]{0,3}", value) is not None,
+            "PRELEASE_RETENTION must be an integer from 1 to 9999")
+    return int(value)
+
+
+def prelease_marker(candidate):
+    return f"Source: {candidate['ref']} @ {candidate['sha']}"
+
+
+def owned_prelease(release, value):
+    match = re.fullmatch(rf"v{re.escape(value)}-pre\.([1-9][0-9]*)",
+                         release.get("tag_name") or "")
+    body = release.get("body") or ""
+    lines = body.splitlines()
+    marker = re.fullmatch(
+        rf"Source: refs/heads/(?:prelease|prerelease)/{re.escape(value)} @ ([0-9a-f]{{40}})",
+        lines[2] if len(lines) > 2 else "")
+    return (match is not None and release.get("prerelease") is True
+            and (release.get("author") or {}).get("login") == os.environ["APP_SLUG"] + "[bot]"
+            and len(lines) == 3 and lines[1] == "" and marker is not None
+            and marker[1] == release.get("target_commitish")
+            and re.fullmatch(
+                r"Built by the trusted \[publisher\]\(https://github\.com/"
+                r"Ebenderooock/loom-publisher/actions/runs/[1-9][0-9]*\)\.",
+                lines[0], re.IGNORECASE) is not None)
+
+
+def prelease_tag_sha(api, tag, sha):
+    require(resolve(api, "refs/tags/" + tag) == sha,
+            "Prerelease tag does not point to source SHA")
+
+
+def publish_prelease(api, candidate, directory, retention):
+    _, value = ref_policy(candidate["ref"])
+    releases = list(api.pages(source_path("releases")))
+    matching = [r for r in releases if owned_prelease(r, value)
+                and prelease_marker(candidate) in (r.get("body") or "").splitlines()
+                and r.get("target_commitish") == candidate["sha"]]
+    require(len(matching) <= 1, "Multiple prereleases for source; owner investigation required")
+    release = matching[0] if matching else None
+    pattern = re.compile(rf"v{re.escape(value)}-pre\.([1-9][0-9]*)")
+    if release is None:
+        numbers = [int(m[1]) for item in releases
+                   if (m := pattern.fullmatch(item.get("tag_name") or ""))]
+        numbers += [int(m[1]) for item in api.pages(source_path("tags"))
+                    if (m := pattern.fullmatch(item.get("name") or ""))]
+        tag = f"v{value}-pre.{max(numbers, default=0) + 1}"
+        revalidate(api, candidate)
+        # Reserve the tag at the exact SHA; GitHub otherwise ignores
+        # target_commitish when a tag already exists.
+        api.call(source_path("git/refs"), {"ref": "refs/tags/" + tag,
+                                           "sha": candidate["sha"]})
+        prelease_tag_sha(api, tag, candidate["sha"])
+        body = ("Built by the trusted [publisher](" + os.environ["PUBLISHER_RUN_URL"]
+                + ").\n\n" + prelease_marker(candidate))
+        release = api.call(source_path("releases"), {
+            "tag_name": tag, "target_commitish": candidate["sha"], "name": tag,
+            "body": body, "draft": True, "prerelease": True, "make_latest": "false",
+        })
+    tag = release["tag_name"]
+    require(owned_prelease(release, value)
+            and prelease_marker(candidate) in release["body"].splitlines()
+            and release.get("target_commitish") == candidate["sha"],
+            "Prerelease ownership or source mismatch")
+    prelease_tag_sha(api, tag, candidate["sha"])
+    release_id = release.get("id")
+    require(type(release_id) is int and release_id > 0, "Invalid release ID")
+    if release.get("draft") is True:
+        listed = list(api.pages(source_path(f"releases/{release_id}/assets")))
+        assets = {asset["name"]: asset for asset in listed}
+        require(len(assets) == len(listed), "Duplicate draft assets")
+        expected = {path.name for path in directory.iterdir()}
+        # A newer CI attempt for the same SHA changes native filenames. Remove
+        # only recognized older CI-versioned assets from our own draft.
+        old_versions = set()
+        for name in set(assets) - expected:
+            match = re.match(rf"^(?:loom_|loom-source-v)({re.escape(value)}-pre\."
+                             r"[1-9][0-9]*\.[1-9][0-9]*)(?:_|\.tar\.gz)", name)
+            require(match is not None, "Unexpected existing draft assets")
+            old_versions.add(match[1])
+        allowed_old = set().union(*(expected_assets(v) for v in old_versions))
+        require(set(assets) - expected <= allowed_old, "Unexpected existing draft assets")
+        for name in sorted(set(assets) - expected):
+            asset_id = assets[name].get("id")
+            require(type(asset_id) is int and asset_id > 0, "Invalid asset ID")
+            api.call(source_path(f"releases/assets/{asset_id}"), method="DELETE")
+            del assets[name]
+        for path in sorted(directory.iterdir()):
+            data = path.read_bytes()
+            if path.name in assets:
+                if assets[path.name].get("digest") == "sha256:" + hashlib.sha256(data).hexdigest():
+                    continue
+                asset_id = assets[path.name]["id"]
+                require(type(asset_id) is int and asset_id > 0, "Invalid asset ID")
+                api.call(source_path(f"releases/assets/{asset_id}"), method="DELETE")
+            api.call(source_path(f"releases/{release_id}/assets?name="
+                                 + urllib.parse.quote(path.name, safe="")), raw=data)
+        listed = list(api.pages(source_path(f"releases/{release_id}/assets")))
+        assets = {asset["name"]: asset for asset in listed}
+        require(len(assets) == len(listed)
+                and set(assets) == {path.name for path in directory.iterdir()},
+                "Incomplete prerelease asset upload")
+        for path in directory.iterdir():
+            with path.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            require(assets[path.name].get("digest") == "sha256:" + digest,
+                    "Prerelease uploaded asset digest mismatch")
+        revalidate(api, candidate)
+        current = api.call(source_path(f"releases/{release_id}"))
+        require(current.get("draft") is True and owned_prelease(current, value)
+                and current.get("tag_name") == tag
+                and current.get("target_commitish") == candidate["sha"]
+                and prelease_marker(candidate) in current["body"].splitlines(),
+                "Prerelease draft changed before publication")
+        prelease_tag_sha(api, tag, candidate["sha"])
+        api.call(source_path(f"releases/{release_id}"), {
+            "draft": False, "prerelease": True, "make_latest": "false",
+        }, method="PATCH")
+        prelease_tag_sha(api, tag, candidate["sha"])
+    else:
+        require(release.get("draft") is False, "Invalid prerelease state")
+    # Delete only older, published, publisher-owned releases and tags for this
+    # exact version. The newest retained release preserves the sequence high-water mark.
+    releases = list(api.pages(source_path("releases")))
+    owned = [r for r in releases if r.get("draft") is False and owned_prelease(r, value)]
+    owned.sort(key=lambda r: int(pattern.fullmatch(r["tag_name"])[1]), reverse=True)
+    for old in owned[retention:]:
+        if old.get("id") == release_id:
+            continue
+        old_id = old.get("id")
+        require(type(old_id) is int and old_id > 0, "Invalid old release ID")
+        current = api.call(source_path(f"releases/{old_id}"))
+        require(current.get("id") == old_id and current.get("draft") is False
+                and current.get("tag_name") == old["tag_name"]
+                and owned_prelease(current, value), "Old prerelease changed")
+        prelease_tag_sha(api, current["tag_name"], current["target_commitish"])
+        revalidate(api, candidate)
+        api.call(source_path(f"releases/{old_id}"), method="DELETE")
+        api.call(source_path("git/refs/tags/" + current["tag_name"]), method="DELETE")
+
+
 def revalidate(api, candidate):
     baseline_check(candidate)
     require(authorize(api, candidate["ref"]) == candidate,
@@ -710,6 +862,10 @@ def revalidate(api, candidate):
 
 def publish(api, candidate, directory):
     kind, value = ref_policy(candidate["ref"])
+    branch_release = kind in ("prelease", "prerelease")
+    if branch_release:
+        native_update_source(candidate)
+        retention = prelease_retention()
     if kind == "release":
         native_update_source(candidate)
         existing = release_record(api, candidate["ref"])
@@ -718,15 +874,16 @@ def publish(api, candidate, directory):
         # Fail before any registry/release writes, including on draft recovery.
         notes = release_notes(api, candidate)
     require({p.name for p in directory.iterdir()} ==
-            ({"image.tar", "assets"} if kind == "release" else {"image.tar"}),
+            ({"image.tar", "assets"} if kind != "main" else {"image.tar"}),
             "Unexpected artifact payload")
     validate_oci(directory / "image.tar",
                  ["amd64", "arm64"] if kind == "release" else ["amd64"],
                  value if kind == "release" else None, candidate["sha"])
-    if kind == "release":
+    if kind != "main":
         require((directory / "assets").is_dir() and not (directory / "assets").is_symlink(),
                 "Unsafe asset directory")
-        digests = validate_assets(directory / "assets", value)
+        _, native_value = native_update_source(candidate)
+        digests = validate_assets(directory / "assets", native_value)
         sign_update_manifest(candidate, directory / "assets", digests)
     advance = False
     if kind == "release" and version(value)[1] is None:
@@ -766,6 +923,9 @@ def publish(api, candidate, directory):
                             "docker://" + IMAGE + ":latest"], check=True)
         revalidate(api, candidate)
         publish_release(api, candidate, directory / "assets", advance, notes)
+    elif branch_release:
+        revalidate(api, candidate)
+        publish_prelease(api, candidate, directory / "assets", retention)
 
 
 def main():
