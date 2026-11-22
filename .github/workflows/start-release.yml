@@ -141,6 +141,7 @@ jobs:
       # Explicit names are required even for callee environment-only secrets.
       LOOM_APP_PRIVATE_KEY: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
       GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+      LOOM_UPDATE_SIGNING_KEY: ${{ secrets.LOOM_UPDATE_SIGNING_KEY }}
 
   completion:
     needs: [inspect, tag-ci, publisher]

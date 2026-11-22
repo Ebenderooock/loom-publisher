@@ -37,6 +37,9 @@ TARGETS = (
     ("darwin", "amd64"), ("darwin", "arm64"),
     ("windows", "amd64"), ("windows", "arm64"),
 )
+UPDATE_PUBLIC_KEYS = (
+    "lCI7LakFLIKQiRmSM0cf40dHB/I2clVq6cn+azUI9TM=",
+)
 
 
 def require(condition, message):
@@ -157,8 +160,8 @@ def require_owned_draft(release, candidate):
 
 
 class API:
-    def __init__(self):
-        self.token = os.environ["LOOM_TOKEN"]
+    def __init__(self, token=None):
+        self.token = os.environ["LOOM_TOKEN"] if token is None else token
         require(self.token, "LOOM_TOKEN is required")
 
     def call(self, path, data=None, method=None, raw=None):
@@ -384,11 +387,96 @@ def validate_assets(directory, value):
             require(sbom.get("spdxVersion", "").startswith("SPDX-"), "Invalid SBOM")
     # Assets are opaque data. Never extract archives or execute their contents.
     checksums = []
+    digests = {}
     for name in sorted(expected):
         with (directory / name).open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         checksums.append(f"{digest}  {name}\n")
+        digests[name] = digest
     (directory / "checksums.txt").write_text("".join(checksums))
+    return digests
+
+
+def native_update_source(candidate):
+    kind, value = ref_policy(candidate["ref"])
+    require(SHA.fullmatch(candidate["sha"]), "Invalid native update source SHA")
+    require(kind != "main", "Main has no native update release")
+    core, pre, metadata = version(value)
+    require(metadata is None and all(n <= 2**64 - 1 for n in core),
+            "Version unsupported by native update verifier")
+    if kind == "release":
+        require(pre is None,
+                "Tagged prereleases cannot satisfy branch-bound native Prelease contract")
+        return "stable", value
+    return "prelease", value
+
+
+def update_manifest(candidate, digests):
+    channel, value = native_update_source(candidate)
+    require(set(digests) == expected_assets(value), "Missing/unexpected validated asset digests")
+    assets = []
+    for system, arch in TARGETS:
+        name = f"loom_{value}_{system}_{arch}." + ("zip" if system == "windows" else "tar.gz")
+        digest = digests[name]
+        require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest),
+                "Invalid native update archive digest")
+        require(len(name) <= 200, "Native update archive name too long")
+        assets.append({"platform": f"{system}-{arch}", "name": name, "sha256": digest})
+    return json.dumps({
+        "schema_version": 1, "channel": channel, "version": value,
+        "source_ref": candidate["ref"], "source_sha": candidate["sha"], "assets": assets,
+    }, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+
+
+def verify_update_signature(raw, encoded_signature):
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        signature = base64.b64decode(encoded_signature, validate=True)
+    except ValueError:
+        raise ValueError("Invalid native update signature encoding") from None
+    require(len(signature) == 64, "Invalid native update signature length")
+    require(base64.b64encode(signature) == encoded_signature,
+            "Non-canonical native update signature encoding")
+    require(1 <= len(UPDATE_PUBLIC_KEYS) <= 4, "Configure one to four native update public keys")
+    keys = []
+    for encoded in UPDATE_PUBLIC_KEYS:
+        try:
+            key = base64.b64decode(encoded, validate=True)
+        except ValueError:
+            raise ValueError("Invalid native update public key encoding") from None
+        require(len(key) == 32, "Invalid native update public key length")
+        require(base64.b64encode(key).decode("ascii") == encoded,
+                "Non-canonical native update public key encoding")
+        keys.append(Ed25519PublicKey.from_public_bytes(key))
+    for key in keys:
+        try:
+            key.verify(signature, raw)
+            return
+        except InvalidSignature:
+            continue
+    raise ValueError("Native update signature is not trusted")
+
+
+def sign_update_manifest(candidate, directory, digests):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    raw = update_manifest(candidate, digests)
+    pem = os.environ.get("LOOM_UPDATE_SIGNING_KEY", "")
+    require(pem.startswith("-----BEGIN PRIVATE KEY-----"),
+            "LOOM_UPDATE_SIGNING_KEY must be an unencrypted PKCS#8 PEM")
+    try:
+        key = serialization.load_pem_private_key(pem.encode("ascii"), password=None)
+    except (ValueError, TypeError):
+        raise ValueError("Invalid LOOM_UPDATE_SIGNING_KEY PKCS#8 PEM") from None
+    require(isinstance(key, Ed25519PrivateKey), "LOOM_UPDATE_SIGNING_KEY must be Ed25519")
+    signature = base64.b64encode(key.sign(raw))
+    verify_update_signature(raw, signature)
+    # Only public metadata leaves memory; neither the PEM nor key is written.
+    (directory / "update-manifest.json").write_bytes(raw)
+    (directory / "update-manifest.json.sig").write_bytes(signature)
 
 
 OCI = "application/vnd.oci."
@@ -623,6 +711,7 @@ def revalidate(api, candidate):
 def publish(api, candidate, directory):
     kind, value = ref_policy(candidate["ref"])
     if kind == "release":
+        native_update_source(candidate)
         existing = release_record(api, candidate["ref"])
         if existing:
             require_owned_draft(existing, candidate)
@@ -637,7 +726,8 @@ def publish(api, candidate, directory):
     if kind == "release":
         require((directory / "assets").is_dir() and not (directory / "assets").is_symlink(),
                 "Unsafe asset directory")
-        validate_assets(directory / "assets", value)
+        digests = validate_assets(directory / "assets", value)
+        sign_update_manifest(candidate, directory / "assets", digests)
     advance = False
     if kind == "release" and version(value)[1] is None:
         advance = latest_allowed(value, registry_latest())

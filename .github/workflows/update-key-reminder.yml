@@ -1,0 +1,24 @@
+name: Yearly update key rotation
+on:
+  schedule:
+    - cron: "0 9 23 11 *"
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+concurrency:
+  group: update-key-rotation-reminder
+  cancel-in-progress: false
+jobs:
+  reminder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Open a yearly checklist unless one is already open
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 update_rotation.py reminder

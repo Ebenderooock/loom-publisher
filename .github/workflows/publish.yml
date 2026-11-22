@@ -18,6 +18,8 @@ on:
         required: true
       GHCR_PUBLISH_TOKEN:
         required: true
+      LOOM_UPDATE_SIGNING_KEY:
+        required: true
     outputs:
       candidate:
         value: ${{ jobs.discover.outputs.candidate }}
@@ -182,6 +184,8 @@ jobs:
           persist-credentials: false
       - name: Recheck trusted entry point before credentials, including reruns
         run: python3 release_start.py publisher-guard
+      - name: Install publisher dependencies
+        run: python3 -m pip install -r requirements.txt
       - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         id: app
         with:
@@ -210,6 +214,7 @@ jobs:
           CANDIDATE: ${{ needs.discover.outputs.candidate }}
           APP_SLUG: ${{ steps.app.outputs.app-slug }}
           GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+          LOOM_UPDATE_SIGNING_KEY: ${{ secrets.LOOM_UPDATE_SIGNING_KEY }}
           GHCR_USERNAME: ${{ vars.GHCR_PUBLISH_USERNAME }}
           PUBLISHING_ENABLED: ${{ vars.PUBLISHING_ENABLED }}
           PUBLISHING_NOT_BEFORE: ${{ vars.PUBLISHING_NOT_BEFORE }}

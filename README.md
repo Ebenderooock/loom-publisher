@@ -43,6 +43,10 @@ digest/size mismatches, excess/unreferenced blobs, and unexpected asset names.
 Checksums are generated again in the trusted job. Artifacts remain **untrusted
 payloads**, not evidence that the program is benign.
 
+Native update manifests are generated from those independently computed archive
+digests and signed only in the protected publication job. The source build never
+receives the update signing key.
+
 ## Owner setup / cutover (administrative access required)
 
 The implementing account has write, not admin. Nothing below is performed by
@@ -140,7 +144,8 @@ this bootstrap. Keep `PUBLISHING_ENABLED` unset until completion.
    the first eligible **new** source push in each desired channel.
 
 Unset/false activation skips scheduled work; manual requests fail clearly until
-fully configured. Missing App/PAT/variables fail enabled jobs. Environment
+fully configured. Missing App/PAT/variables fail enabled jobs; native releases
+also require the update signing key described below. Environment
 protection must exist before secrets are added. Setting the switch alone is
 not a security boundary against an unprotected publisher branch.
 
@@ -152,7 +157,8 @@ creation-ruleset App bypass above is configured, the repository owner
 selects **main**, and enters a version **without `v`**, for example **`0.4.2`**.
 Do not push a local tag first: the workflow creates the canonical annotated
 remote tag through the GitHub API. Strict semver, prerelease/build metadata, and
-the publisher's existing 110-character limit apply.
+the publisher's existing 110-character parsing limit apply; native publication
+now requires a plain Stable `X.Y.Z` as explained under signed native updates.
 
 Only explicit owner dispatch is accepted: publisher repository/owner numeric
 IDs, actor ID, original event sender, triggering actor on reruns, workflow path,
@@ -192,7 +198,7 @@ The workflow:
    main, latest green main/tag push CI, the annotated tag and tagged changelog
    again. Existing publisher ref/CI revalidation, isolated builds, asset
    validation, immutable-release handling and GHCR credentials remain intact;
-   `publisher.py` policy is unchanged.
+   native manifest signing and verification are additionally required.
 5. Reports success with release/assets, CI, container package and image links
    **only after the actual trusted publishing step completes**, not after
    dispatch/queue acceptance. Expand the nested publisher jobs for failures.
@@ -201,13 +207,14 @@ Secret-bearing jobs use only the main-only **production-publish** environment.
 Control runners check out only publisher code, never source code or source build
 scripts. The reusable call explicitly maps the existing optional build key
 `TVDB_APIKEY` and the required names `LOOM_APP_PRIVATE_KEY` and
-`GHCR_PUBLISH_TOKEN`. GitHub requires callers to pass environment-secret names
+`GHCR_PUBLISH_TOKEN`, plus `LOOM_UPDATE_SIGNING_KEY`. GitHub requires callers to pass environment-secret names
 even when those secrets exist only in the callee's environment; otherwise they
 resolve empty ([reusable workflow secret rules](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-inputs-and-secrets-in-a-reusable-workflow)).
 App and GHCR values still resolve only in jobs selecting **production-publish**;
 do not copy them to repository secrets or use blanket `secrets: inherit`.
 The source build job has no environment and references neither credential.
-The reusable contract requires both names, and discovery rechecks their values.
+The reusable contract requires all three protected secret names; discovery
+rechecks the App/PAT values and native publication validates the signing key.
 The pre-tag check detects missing values, not PAT expiry, scopes or package
 authorization; it does not publish or replace **Verify publishing credential**.
 There is no cross-workflow dispatch token, webhook, paid service, or dependency on
@@ -273,13 +280,114 @@ Semver strings over 110 characters are explicitly rejected. Build metadata
 remains unchanged in public tag, asset names and status context. `_` cannot occur
 in accepted semver, so the Docker encoding is collision-free.
 
-Release assets on **loom**, public and prerelease-classified by semver:
+Native Stable release assets on **loom**:
 
 - `loom_<version>_{linux_{amd64,arm64,armv7},darwin_{amd64,arm64}}.tar.gz`
 - `loom_<version>_windows_{amd64,arm64}.zip`
 - `loom-source-v<version>.tar.gz`, containing tracked sources and built `web/dist`
 - a Syft SPDX JSON SBOM per archive (`<archive>.sbom.spdx.json`)
 - trusted `checksums.txt` covering all archives and SBOMs.
+- `update-manifest.json` and `update-manifest.json.sig`, generated and verified
+  in the trusted publish job (not accepted from build artifacts).
+
+### Signed native updates: setup and rotation
+
+Store the active **Ed25519 unencrypted PKCS#8 PEM** (`-----BEGIN PRIVATE KEY-----`)
+as environment secret **`production-publish/LOOM_UPDATE_SIGNING_KEY`**. Never
+store it in the source repository, repository/org secrets, command arguments,
+logs, or commits. The publisher loads it into memory; it writes no private-key
+file. Signing dependencies are pinned in `requirements.txt`. The secret is
+exposed only to the protected `publish` job's publication step, not discovery,
+tag creation or source builds. Every reusable caller must explicitly map
+`LOOM_UPDATE_SIGNING_KEY: ${{ secrets.LOOM_UPDATE_SIGNING_KEY }}`; do not use
+`secrets: inherit` or copy an environment-only secret to repository scope.
+
+`publisher.py`'s reviewed `UPDATE_PUBLIC_KEYS` tuple accepts **one to four**
+raw 32-byte Ed25519 public keys, encoded with standard base64. The initial key is
+`lCI7LakFLIKQiRmSM0cf40dHB/I2clVq6cn+azUI9TM=`. Loom must separately ship that
+public key in `internal/updates/trusted-keys.json`. A missing, malformed,
+wrong-algorithm or untrusted private key fails before registry/release writes.
+Each signature is verified against the entire configured public-key set before
+either public manifest asset is written. No unsigned fallback is published.
+
+The compact UTF-8 JSON has exactly `schema_version`, `channel`, `version`,
+`source_ref`, `source_sha` and `assets`; assets contain only `platform`, `name`
+and `sha256`. Exactly seven binary archives are listed, including **both Windows
+ZIPs**; source archives, SBOMs and checksums are not manifest entries. The detached
+signature asset is canonical standard base64 of the raw 64-byte Ed25519 signature
+over those exact JSON bytes, with no newline, envelope or domain prefix.
+Both assets go through the existing draft-first upload/recovery flow; an upload
+failure leaves the release unpublished. `checksums.txt` still covers only the
+original archives/SBOMs; it is not the signature trust root.
+
+Stable binds `refs/tags/vX.Y.Z` and release tag `vX.Y.Z`. Loom's native verifier
+does not accept build metadata, overflowing uint64 version components, or a
+tag-bound prerelease as a native Prelease manifest. Those tagged publications
+now **fail closed before any registry/release writes**, rather than silently
+publishing unsigned or unverifiable native assets. Ordinary Stable versions
+remain supported; tag/version parsing for other control-plane operations is
+unchanged. Use a plain `X.Y.Z` version with Start release.
+
+**Prelease stream gap:** this publisher currently publishes only container images
+from `prelease/X.Y.Z` and `prerelease/X.Y.Z`; it does not build/publish native
+GitHub releases for those branches. No new release stream is introduced here.
+The manifest generator supports either branch spelling with channel `prelease`,
+but it is not invoked for those container-only publications. Completing native
+Prelease publishing requires separate branch-bound native builds and draft
+releases with unique tags independent of the SemVer version. Existing tagged rc
+GitHub prereleases cannot substitute for that contract.
+
+For planned rotation, generate a new key privately, then add its public key
+alongside the old one in both the reviewed publisher tuple and Loom's compiled
+trust roots. Ship that overlapping-trust Loom build **before** replacing the
+environment secret with the new active private key. Verify publication using the
+new key through the normal protected flow; do not rewrite public releases.
+Only remove the old public key after supported installations have the new trust
+root and any required old signed releases no longer need verification. The
+publisher signs with one active key, never multiple signatures or test keys.
+For compromise, disable publishing and rotate/revoke deliberately; an overlap
+still trusts the old key and is not revocation.
+
+The recommended active-key lifetime is **one year**. **Yearly update key rotation**
+runs each November 23 at 09:00 UTC (or via owner `workflow_dispatch`) and opens a
+**Rotate update signing key** checklist issue here, unless that issue is already
+open. It uses only the publisher's issues-scoped `GITHUB_TOKEN`, no signing or
+App credentials, and never rotates a key automatically.
+
+Generate the new private key **offline**, for example:
+
+```sh
+openssl genpkey -algorithm ed25519 -out loom-update.pem
+```
+
+Extract its raw 32-byte public key locally and encode it with standard base64;
+never enter the PEM into a workflow. As owner, run **Propose update trust key** on
+publisher main with that public key and a unique id matching
+`[a-z][a-z0-9-]{0,39}` (for example `production-2027`). The public input is strictly
+validated for canonical standard base64 and exactly 32 decoded bytes. The
+workflow proposes only an additive edit to Loom's `internal/updates/trusted-keys.json`,
+preserving existing keys, with a maximum overlap of four keys. It selects the
+highest numeric `prelease/X.Y.Z` branch by default (currently `prelease/0.4.6`);
+provide `base_branch` explicitly when another integration branch is intended.
+Review the selected PR base before merging. An existing key id, duplicate public
+key or proposal branch fails rather than overwriting it; inspect an existing
+proposal before retrying.
+
+The protected proposal job checks the existing App installation's permissions
+with an App-authenticated read **before** minting a source-scoped installation
+token. It requires **Contents write and Pull requests write** on Loom. The
+original App setup above requires Contents but not Pull requests; live approval
+of Pull requests write could not be confirmed during implementation. If missing,
+the workflow stops with an explicit owner-action error. An administrator must
+review the App permission and approve it on the existing Loom installation;
+this change grants nothing and does not add installations, tokens or bypasses.
+No update private key is handled by either rotation workflow. App credentials
+remain environment-only and owner/main guarded, including reruns.
+
+Merge and release the Loom overlapping-trust PR first. Only after that release,
+merge the publisher verifier-set addition and swap the environment signing
+secret. One or two releases later, propose removal of the old Loom public key
+after confirming installation compatibility; removal is never automated.
 
 Binary archives retain LICENSE/README/CHANGELOG, platform packaging, and
 top-level docs. Publisher-owned Python cross-compilation/package logic replaces
@@ -365,11 +473,15 @@ templates, or GoReleaser configuration run in publication jobs.
 
 ## Local checks (no production credentials)
 
-Requires Python 3.12+ (standard `ubuntu-latest` includes it) and Go for actionlint:
+Requires Python 3.12+ (standard `ubuntu-latest` includes it), the pinned signing
+dependency and Go for actionlint. Use a virtual environment on managed Python:
 
 ```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements.txt
 python3 -m unittest discover -s tests -v
-python3 -m py_compile publisher.py build.py release_start.py tests/test_*.py
+python3 -m py_compile publisher.py build.py release_start.py update_rotation.py tests/test_*.py
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= .github/workflows/*.yml
 ```
 
