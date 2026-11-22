@@ -1,0 +1,67 @@
+name: Propose update trust key
+on:
+  workflow_dispatch:
+    inputs:
+      public_key:
+        description: "Raw 32-byte Ed25519 PUBLIC key, canonical standard base64"
+        required: true
+        type: string
+      key_id:
+        description: "Unique id matching [a-z][a-z0-9-]{0,39}"
+        required: true
+        type: string
+      base_branch:
+        description: "Loom base branch (empty = highest numeric prelease/X.Y.Z)"
+        required: false
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: update-trust-key-proposal
+  cancel-in-progress: false
+env:
+  UPDATE_PUBLIC_KEY: ${{ inputs.public_key }}
+  UPDATE_KEY_ID: ${{ inputs.key_id }}
+  BASE_BRANCH: ${{ inputs.base_branch }}
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate owner, protected entry point and public inputs
+        run: python3 update_rotation.py guard
+  propose:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production-publish
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Recheck owner before accessing App credentials
+        run: python3 update_rotation.py guard
+      - run: python3 -m pip install -r requirements.txt
+      - name: Require already-approved installation permissions without granting any
+        env:
+          LOOM_APP_ID: ${{ vars.LOOM_APP_ID }}
+          LOOM_APP_PRIVATE_KEY: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
+        run: python3 update_rotation.py permissions
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.LOOM_APP_ID }}
+          private-key: ${{ secrets.LOOM_APP_PRIVATE_KEY }}
+          owner: Ebenderooock
+          repositories: loom
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Propose only the additive public trust-root change
+        env:
+          LOOM_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 update_rotation.py propose

@@ -569,9 +569,10 @@ class WorkflowPolicyTests(unittest.TestCase):
             "TVDB_APIKEY": "TVDB_APIKEY",
             "LOOM_APP_PRIVATE_KEY": "LOOM_APP_PRIVATE_KEY",
             "GHCR_PUBLISH_TOKEN": "GHCR_PUBLISH_TOKEN",
+            "LOOM_UPDATE_SIGNING_KEY": "LOOM_UPDATE_SIGNING_KEY",
         })
         contract = self.publish.split("    secrets:\n", 1)[1].split("    outputs:\n", 1)[0]
-        for name in ("LOOM_APP_PRIVATE_KEY", "GHCR_PUBLISH_TOKEN"):
+        for name in ("LOOM_APP_PRIVATE_KEY", "GHCR_PUBLISH_TOKEN", "LOOM_UPDATE_SIGNING_KEY"):
             self.assertRegex(contract, rf"      {name}:\n        required: true")
         self.assertIn("      TVDB_APIKEY:\n        required: false", contract)
         self.assertNotIn("secrets: inherit", self.start + self.publish)

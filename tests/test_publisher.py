@@ -13,6 +13,10 @@ from unittest.mock import Mock, patch
 import urllib.error
 import zipfile
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.rsa import generate_private_key
+
 import build
 import publisher as p
 
@@ -512,6 +516,192 @@ class ArtifactTests(unittest.TestCase):
             p.validate_assets(directory, "1.2.3")
 
 
+class NativeUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name)
+        self.candidate = {"ref": "refs/tags/v1.2.3", "sha": SHA}
+        self.key = Ed25519PrivateKey.generate()
+        self.public = base64.b64encode(self.key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+        self.pem = self.key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()).decode()
+        for name in p.expected_assets("1.2.3"):
+            (self.directory / name).write_bytes(
+                b'{"spdxVersion":"SPDX-2.3"}' if name.endswith(".json") else name.encode())
+        self.digests = p.validate_assets(self.directory, "1.2.3")
+
+    def sign(self, pem=None):
+        with patch.dict(os.environ, LOOM_UPDATE_SIGNING_KEY=self.pem if pem is None else pem):
+            p.sign_update_manifest(self.candidate, self.directory, self.digests)
+
+    def test_exact_manifest_bytes_and_all_seven_archive_digests(self):
+        assets = []
+        for system, arch in p.TARGETS:
+            suffix = "zip" if system == "windows" else "tar.gz"
+            name = f"loom_1.2.3_{system}_{arch}.{suffix}"
+            assets.append(
+                '{"platform":"' + system + "-" + arch + '","name":"' + name
+                + '","sha256":"' + hashlib.sha256(name.encode()).hexdigest() + '"}')
+        expected = ('{"schema_version":1,"channel":"stable","version":"1.2.3",'
+                    '"source_ref":"refs/tags/v1.2.3","source_sha":"' + SHA
+                    + '","assets":[' + ",".join(assets) + "]}").encode()
+        self.assertEqual(p.update_manifest(self.candidate, self.digests), expected)
+        for alias in ("prelease", "prerelease"):
+            candidate = self.candidate | {"ref": f"refs/heads/{alias}/1.2.3"}
+            manifest = json.loads(p.update_manifest(candidate, self.digests))
+            self.assertEqual(manifest["channel"], "prelease")
+            self.assertEqual(manifest["source_ref"], candidate["ref"])
+            self.assertEqual(manifest["version"], "1.2.3")
+
+    def test_signature_round_trip_and_rotation_overlap(self):
+        with patch.object(p, "UPDATE_PUBLIC_KEYS", (*p.UPDATE_PUBLIC_KEYS, self.public)):
+            self.sign()
+            raw = (self.directory / "update-manifest.json").read_bytes()
+            sig = (self.directory / "update-manifest.json.sig").read_bytes()
+            self.assertEqual(len(base64.b64decode(sig, validate=True)), 64)
+            self.key.public_key().verify(base64.b64decode(sig, validate=True), raw)
+            p.verify_update_signature(raw, sig)
+            with self.assertRaisesRegex(ValueError, "not trusted"):
+                p.verify_update_signature(raw + b"\n", sig)
+            self.sign()
+            self.assertEqual((self.directory / "update-manifest.json.sig").read_bytes(), sig)
+
+    def test_wrong_missing_malformed_and_non_ed25519_keys_leave_no_manifest(self):
+        rsa = generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()).decode()
+        for pem in ("", "not a key", "-----BEGIN PRIVATE KEY-----\nbad", rsa, self.pem):
+            with self.subTest(kind=pem[:27]), self.assertRaises(ValueError):
+                self.sign(pem)
+            self.assertFalse((self.directory / "update-manifest.json").exists())
+            self.assertFalse((self.directory / "update-manifest.json.sig").exists())
+
+    def test_signature_and_verifier_configuration_fail_closed(self):
+        raw = p.update_manifest(self.candidate, self.digests)
+        sig = base64.b64encode(self.key.sign(raw))
+        noncanonical = sig[:-3] + bytes([sig[-3] + 1]) + sig[-2:]
+        with patch.object(p, "UPDATE_PUBLIC_KEYS", (self.public,)):
+            for bad in (b"%%%", base64.b64encode(b"x" * 63), sig + b"\n", noncanonical):
+                with self.subTest(sig=bad), self.assertRaises(ValueError):
+                    p.verify_update_signature(raw, bad)
+        for keys in ((), ("bad",), (base64.b64encode(b"x").decode(),),
+                     (self.public,) * 5, (self.public, "bad")):
+            with patch.object(p, "UPDATE_PUBLIC_KEYS", keys), self.assertRaises(ValueError):
+                p.verify_update_signature(raw, sig)
+
+    def test_invalid_source_or_asset_inventory_fails_closed(self):
+        for changes in ({"sha": "A" * 40}, {"ref": "refs/heads/main"},
+                        {"ref": "refs/tags/v1.2.3-rc.1"}, {"ref": "refs/tags/v1.2.3+build"},
+                        {"ref": "refs/tags/v18446744073709551616.2.3"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                p.update_manifest(self.candidate | changes, self.digests)
+        name = "loom_1.2.3_windows_arm64.zip"
+        for digests in ({k: v for k, v in self.digests.items() if k != name},
+                        self.digests | {"unexpected.zip": "0" * 64},
+                        self.digests | {name: "A" * 64}):
+            with self.assertRaises(ValueError):
+                p.update_manifest(self.candidate, digests)
+
+    def test_unsupported_tagged_releases_fail_before_network_or_registry_writes(self):
+        for ref in ("refs/tags/v1.2.3-rc.1", "refs/tags/v1.2.3+build"):
+            api = Mock()
+            with patch("publisher.subprocess.run") as command, self.assertRaises(ValueError):
+                p.publish(api, self.candidate | {"ref": ref}, self.directory)
+            api.call.assert_not_called()
+            api.pages.assert_not_called()
+            command.assert_not_called()
+
+    def test_signing_failure_precedes_any_registry_or_release_writes(self):
+        root = self.directory
+        assets = root / "assets"
+        assets.mkdir()
+        for path in list(root.iterdir()):
+            if path.is_file():
+                path.rename(assets / path.name)
+        (assets / "checksums.txt").unlink()
+        write_oci(root / "image.tar", oci_members(("amd64", "arm64")))
+        api = Mock()
+        with patch.dict(os.environ, LOOM_UPDATE_SIGNING_KEY=""):
+            with patch("publisher.release_record", return_value=None), \
+                    patch("publisher.release_notes", return_value="- Notes."), \
+                    patch("publisher.subprocess.run") as command:
+                with self.assertRaisesRegex(ValueError, "LOOM_UPDATE_SIGNING_KEY"):
+                    p.publish(api, self.candidate, root)
+        command.assert_not_called()
+        api.call.assert_not_called()
+
+    def test_both_signed_assets_upload_before_finalization_and_failure_leaves_draft(self):
+        with patch.object(p, "UPDATE_PUBLIC_KEYS", (self.public,)):
+            self.sign()
+        draft = {"id": 5, "draft": True, "author": {"login": "publisher[bot]"},
+                 "target_commitish": SHA, "tag_name": "v1.2.3",
+                 "body": "Built by the trusted [publisher](" + URL + ")."}
+        for fail in (False, True):
+            api = Mock()
+            api.pages.return_value = iter([])
+            uploaded = {}
+
+            def call(path, data=None, method=None, raw=None):
+                if raw is not None:
+                    name = path.split("?name=")[1]
+                    if fail and name == "update-manifest.json.sig":
+                        raise RuntimeError("Upload failed")
+                    uploaded[name] = raw
+                return draft
+
+            api.call.side_effect = call
+            with patch.dict(os.environ, APP_SLUG="publisher", PUBLISHER_RUN_URL=URL):
+                with patch("publisher.release_record", return_value=None), \
+                        patch("publisher.revalidate"):
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "Upload failed"):
+                            p.publish_release(api, self.candidate, self.directory, False, "- Notes.")
+                        self.assertFalse(any(c.kwargs.get("method") == "PATCH"
+                                             for c in api.call.call_args_list))
+                    else:
+                        p.publish_release(api, self.candidate, self.directory, False, "- Notes.")
+                        self.assertEqual(uploaded["update-manifest.json"],
+                                         p.update_manifest(self.candidate, self.digests))
+                        with patch.object(p, "UPDATE_PUBLIC_KEYS", (self.public,)):
+                            p.verify_update_signature(uploaded["update-manifest.json"],
+                                                      uploaded["update-manifest.json.sig"])
+                        self.assertFalse(api.call.call_args.args[1]["draft"])
+
+    def test_production_publish_generates_verified_metadata_before_registry_copy(self):
+        assets = self.directory / "assets"
+        assets.mkdir()
+        for path in list(self.directory.iterdir()):
+            if path.is_file():
+                path.rename(assets / path.name)
+        (assets / "checksums.txt").unlink()
+        write_oci(self.directory / "image.tar", oci_members(("amd64", "arm64")))
+        copied = []
+
+        def copy(*args, **kwargs):
+            raw = (assets / "update-manifest.json").read_bytes()
+            sig = (assets / "update-manifest.json.sig").read_bytes()
+            p.verify_update_signature(raw, sig)
+            self.assertEqual(raw, p.update_manifest(self.candidate, self.digests))
+            copied.append(args[0][-1])
+
+        with patch.dict(os.environ, LOOM_UPDATE_SIGNING_KEY=self.pem):
+            with patch.object(p, "UPDATE_PUBLIC_KEYS", (self.public,)), \
+                    patch("publisher.release_record", return_value=None), \
+                    patch("publisher.release_notes", return_value="- Notes."), \
+                    patch("publisher.registry_latest", return_value="2.0.0"), \
+                    patch("publisher.candidates", return_value=[self.candidate["ref"]]), \
+                    patch("publisher.revalidate"), \
+                    patch("publisher.subprocess.run", side_effect=copy), \
+                    patch("publisher.publish_release") as release:
+                p.publish(Mock(), self.candidate, self.directory)
+        self.assertEqual(len(copied), 3)
+        release.assert_called_once()
+        self.assertEqual(release.call_args.args[2:], (assets, False, "- Notes."))
+
+
 class ReleaseNotesTests(unittest.TestCase):
     def setUp(self):
         self.candidate = {"ref": "refs/tags/v0.4.2", "sha": SHA}
@@ -738,9 +928,6 @@ class PublicationTests(unittest.TestCase):
              ["2.0.0-amd64", "2.0.0-arm64", "2.0.0", "latest"], True),
             ("refs/tags/v1.2.3", "2.0.0",
              ["1.2.3-amd64", "1.2.3-arm64", "1.2.3"], False),
-            ("refs/tags/v2.0.0-rc.1+build.2", "1.2.3",
-             ["2.0.0-rc.1_build.2-amd64", "2.0.0-rc.1_build.2-arm64",
-              "2.0.0-rc.1_build.2"], False),
         ):
             with self.subTest(ref=ref), tempfile.TemporaryDirectory() as tmp:
                 api = FakeAPI(ref)
@@ -750,7 +937,8 @@ class PublicationTests(unittest.TestCase):
                 if ref.startswith("refs/tags/"):
                     (directory / "assets").mkdir()
                 with patch.dict(os.environ, PUBLISHING_NOT_BEFORE="2026-01-01T00:00:00Z"):
-                    with patch("publisher.validate_oci"), patch("publisher.validate_assets"):
+                    with patch("publisher.validate_oci"), patch("publisher.validate_assets"), \
+                            patch("publisher.sign_update_manifest"):
                         with patch("publisher.release_record", return_value=None):
                             with patch("publisher.registry_latest", return_value=current_latest):
                                 with patch("publisher.subprocess.run") as command:
@@ -849,6 +1037,7 @@ class WorkflowBoundaryTests(unittest.TestCase):
         text = (Path(__file__).resolve().parents[1] / ".github/workflows/publish.yml").read_text()
         build = text.split("\n  build:\n")[1].split("\n  publish:\n")[0]
         for forbidden in ("environment:", "GHCR_PUBLISH_TOKEN", "LOOM_APP_PRIVATE_KEY",
+                          "LOOM_UPDATE_SIGNING_KEY",
                           "create-github-app-token", "secrets.GITHUB_TOKEN", "cache: true"):
             self.assertNotIn(forbidden, build)
         for name in ("discover", "publish"):
