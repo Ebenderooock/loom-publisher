@@ -283,6 +283,19 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("refs/heads/prerelease/1.2.3", refs)
         self.assertNotIn("refs/heads/evil", refs)
 
+    def test_old_container_only_success_does_not_skip_native_prelease(self):
+        ref = "refs/heads/prelease/1.2.3"
+        api = FakeAPI(ref)
+        candidate = p.authorize(api, ref)
+        status = {"context": "loom-publisher/prelease/1.2.3", "state": "success",
+                  "creator": {"login": "publisher[bot]"}, "target_url": URL,
+                  "description": "Trusted publisher: success (CI 100/2)"}
+        api.statuses = [status]
+        with patch.dict(os.environ, APP_SLUG="publisher", PUBLISHER_RUN_URL=URL):
+            self.assertEqual(p.discover(api, ref), candidate)
+            api.statuses = [status | {"description": p.status_description(candidate, "success")}]
+            self.assertIsNone(p.discover(api, ref))
+
     def test_registry_lookup_fails_closed(self):
         for error in ("unauthorized", "timeout", "TLS error"):
             with patch("publisher.subprocess.run", return_value=subprocess.CompletedProcess(
@@ -550,11 +563,31 @@ class NativeUpdateTests(unittest.TestCase):
                     + '","assets":[' + ",".join(assets) + "]}").encode()
         self.assertEqual(p.update_manifest(self.candidate, self.digests), expected)
         for alias in ("prelease", "prerelease"):
-            candidate = self.candidate | {"ref": f"refs/heads/{alias}/1.2.3"}
-            manifest = json.loads(p.update_manifest(candidate, self.digests))
+            candidate = self.candidate | {"ref": f"refs/heads/{alias}/1.2.3",
+                                          "ci_id": 100, "ci_attempt": 2}
+            digests = {name: "a" * 64 for name in p.expected_assets("1.2.3-pre.100.2")}
+            manifest = json.loads(p.update_manifest(candidate, digests))
             self.assertEqual(manifest["channel"], "prelease")
             self.assertEqual(manifest["source_ref"], candidate["ref"])
-            self.assertEqual(manifest["version"], "1.2.3")
+            self.assertEqual(manifest["version"], "1.2.3-pre.100.2")
+
+    def test_branch_manifest_signature_binds_both_aliases_and_ci_version(self):
+        for alias in ("prelease", "prerelease"):
+            candidate = {"ref": f"refs/heads/{alias}/1.2.3", "sha": SHA,
+                         "ci_id": 100, "ci_attempt": 2}
+            value = "1.2.3-pre.100.2"
+            digests = {name: "b" * 64 for name in p.expected_assets(value)}
+            with patch.dict(os.environ, LOOM_UPDATE_SIGNING_KEY=self.pem), \
+                    patch.object(p, "UPDATE_PUBLIC_KEYS", (self.public,)):
+                p.sign_update_manifest(candidate, self.directory, digests)
+                raw = (self.directory / "update-manifest.json").read_bytes()
+                p.verify_update_signature(raw, (self.directory / "update-manifest.json.sig").read_bytes())
+            manifest = json.loads(raw)
+            self.assertEqual((manifest["channel"], manifest["version"], manifest["source_ref"],
+                              manifest["source_sha"]), ("prelease", value, candidate["ref"], SHA))
+            self.assertEqual(len(manifest["assets"]), 7)
+            self.assertTrue(all(asset["name"].startswith("loom_" + value + "_")
+                                for asset in manifest["assets"]))
 
     def test_signature_round_trip_and_rotation_overlap(self):
         with patch.object(p, "UPDATE_PUBLIC_KEYS", (*p.UPDATE_PUBLIC_KEYS, self.public)):
@@ -632,6 +665,28 @@ class NativeUpdateTests(unittest.TestCase):
                     p.publish(api, self.candidate, root)
         command.assert_not_called()
         api.call.assert_not_called()
+
+    def test_prelease_signing_failure_blocks_all_publication_writes(self):
+        root = self.directory / "payload"
+        root.mkdir()
+        assets = root / "assets"
+        assets.mkdir()
+        value = "1.2.3-pre.100.2"
+        for name in p.expected_assets(value):
+            (assets / name).write_bytes(
+                b'{"spdxVersion":"SPDX-2.3"}' if name.endswith(".json") else b"archive")
+        (root / "image.tar").write_bytes(b"opaque")
+        candidate = {"ref": "refs/heads/prerelease/1.2.3", "sha": SHA,
+                     "ci_id": 100, "ci_attempt": 2}
+        api = Mock()
+        with patch.dict(os.environ, LOOM_UPDATE_SIGNING_KEY=""), \
+                patch("publisher.validate_oci"), \
+                patch("publisher.subprocess.run") as command:
+            with self.assertRaisesRegex(ValueError, "LOOM_UPDATE_SIGNING_KEY"):
+                p.publish(api, candidate, root)
+        command.assert_not_called()
+        api.call.assert_not_called()
+        api.pages.assert_not_called()
 
     def test_both_signed_assets_upload_before_finalization_and_failure_leaves_draft(self):
         with patch.object(p, "UPDATE_PUBLIC_KEYS", (self.public,)):
@@ -934,7 +989,7 @@ class PublicationTests(unittest.TestCase):
                 candidate = p.authorize(api, ref)
                 directory = Path(tmp)
                 (directory / "image.tar").write_bytes(b"opaque")
-                if ref.startswith("refs/tags/"):
+                if ref != "refs/heads/main":
                     (directory / "assets").mkdir()
                 with patch.dict(os.environ, PUBLISHING_NOT_BEFORE="2026-01-01T00:00:00Z"):
                     with patch("publisher.validate_oci"), patch("publisher.validate_assets"), \
@@ -942,7 +997,8 @@ class PublicationTests(unittest.TestCase):
                         with patch("publisher.release_record", return_value=None):
                             with patch("publisher.registry_latest", return_value=current_latest):
                                 with patch("publisher.subprocess.run") as command:
-                                    with patch("publisher.publish_release") as release:
+                                    with patch("publisher.publish_release") as release, \
+                                            patch("publisher.publish_prelease") as prelease:
                                         p.publish(api, candidate, directory)
                 self.assertEqual([call.args[0][-1] for call in command.call_args_list],
                                  ["docker://" + p.IMAGE + ":" + tag for tag in expected_tags])
@@ -951,6 +1007,7 @@ class PublicationTests(unittest.TestCase):
                     self.assertEqual(release.call_args.args[-1], "- Fixes.")
                 else:
                     release.assert_not_called()
+                    self.assertEqual(prelease.call_count, int(ref != "refs/heads/main"))
 
     def test_existing_public_release_refused_before_any_registry_write(self):
         candidate = p.authorize(FakeAPI("refs/tags/v1.2.3"), "refs/tags/v1.2.3")
@@ -962,6 +1019,53 @@ class PublicationTests(unittest.TestCase):
 
 
 class BuildPackagingTests(unittest.TestCase):
+    def test_prelease_build_includes_helpers_and_exact_source_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            output = root / "payload"
+            output.mkdir()
+            for name in ("LICENSE", "README.md", "CHANGELOG.md"):
+                (source / name).write_text(name)
+            for platform in ("linux", "macos", "windows"):
+                (source / "packaging" / platform).mkdir(parents=True)
+            (source / "docs").mkdir()
+            (source / "web/dist").mkdir(parents=True)
+            (source / "web/dist/index.html").write_text("ui")
+            candidate = p.authorize(FakeAPI("refs/heads/prelease/1.2.3"),
+                                    "refs/heads/prelease/1.2.3")
+            commands = []
+
+            def fake_run(*args, **kwargs):
+                if args[:2] == ("go", "build"):
+                    commands.append(args)
+                    Path(args[args.index("-o") + 1]).write_bytes(b"binary")
+                elif args[0] == "fake-syft":
+                    Path(args[-1].removeprefix("spdx-json=")).write_text(
+                        '{"spdxVersion": "SPDX-2.3"}')
+
+            def fake_git(command, **kwargs):
+                with tarfile.open(fileobj=kwargs["stdout"], mode="w"):
+                    pass
+
+            with patch.multiple(build, ROOT=root, SOURCE=source, OUTPUT=output), \
+                    patch("build.run", side_effect=fake_run), \
+                    patch("build.subprocess.run", side_effect=fake_git), \
+                    patch.dict(os.environ, SYFT_CMD="fake-syft"):
+                build.release(candidate, "1.2.3-pre.100.2")
+            binaries = [cmd for cmd in commands if cmd[-1] == "./cmd/loom"]
+            helpers = [cmd for cmd in commands if cmd[-1] == "./cmd/loom-updater"]
+            self.assertEqual((len(binaries), len(helpers)), (7, 5))
+            for cmd in binaries:
+                flags = cmd[cmd.index("-ldflags") + 1]
+                self.assertIn("buildinfo.Version=1.2.3-pre.100.2", flags)
+                self.assertIn("buildinfo.Commit=" + SHA, flags)
+                self.assertIn("buildinfo.SourceRef=refs/heads/prelease/1.2.3", flags)
+            with tarfile.open(output / "assets/loom_1.2.3-pre.100.2_linux_amd64.tar.gz") as archive:
+                self.assertIn("loom-updater", archive.getnames())
+            p.validate_assets(output / "assets", "1.2.3-pre.100.2")
+
     def test_seven_archives_curated_embedded_source_and_sboms(self):
         """Exercise actual packaging; mock only external source/tool execution."""
         with tempfile.TemporaryDirectory() as tmp:

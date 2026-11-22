@@ -328,14 +328,31 @@ publishing unsigned or unverifiable native assets. Ordinary Stable versions
 remain supported; tag/version parsing for other control-plane operations is
 unchanged. Use a plain `X.Y.Z` version with Start release.
 
-**Prelease stream gap:** this publisher currently publishes only container images
-from `prelease/X.Y.Z` and `prerelease/X.Y.Z`; it does not build/publish native
-GitHub releases for those branches. No new release stream is introduced here.
-The manifest generator supports either branch spelling with channel `prelease`,
-but it is not invoked for those container-only publications. Completing native
-Prelease publishing requires separate branch-bound native builds and draft
-releases with unique tags independent of the SemVer version. Existing tagged rc
-GitHub prereleases cannot substitute for that contract.
+Both branch spellings also produce signed native GitHub prereleases. The
+manifest and archive version is `X.Y.Z-pre.<source-CI-run-id>.<attempt>`;
+the signed source ref and SHA identify the exact branch build. Native Linux
+and macOS archives include the updater helper. The GitHub tag is independent:
+`vX.Y.Z-pre.<n>`, allocated monotonically across both spellings, including
+existing tags and drafts. The publisher reserves that tag at the source SHA,
+uploads to a draft, verifies uploaded digests, reauthorizes the source, then
+publishes as a prerelease without moving latest. A retry resumes an owned draft
+or reuses the already published release for the same branch and SHA.
+On rollout, an eligible current branch tip with only the old container-only
+success status is eligible for native publication; subsequent native successes
+carry a `native-v1` status marker.
+
+After publication, only older published releases owned by this publisher for
+the same `X.Y.Z` are retained up to **3** by default, with their Git tags
+deleted alongside them. Set the publisher
+repository variable `PRELEASE_RETENTION` to an integer from 1 to 9999 to change
+that limit. The newest retained tag preserves the sequence high-water mark, so
+deleted tag numbers are not reused. A failed cleanup is retried on an explicit
+publication retry; unrelated releases, versions, and drafts are never deleted.
+
+Loom selects the most recently published GitHub prerelease across the repository,
+not per version or branch, so another publisher's newer prerelease can obscure
+this stream. Existing tagged rc GitHub prereleases cannot substitute for the
+branch-bound native manifest contract.
 
 For planned rotation, generate a new key privately, then add its public key
 alongside the old one in both the reviewed publisher tuple and Loom's compiled

@@ -10,7 +10,7 @@ import subprocess
 import tarfile
 import zipfile
 
-from publisher import TARGETS, image_tags, ref_policy, require
+from publisher import TARGETS, image_tags, native_update_source, ref_policy, require
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = Path("source").resolve()
@@ -41,9 +41,13 @@ def release(candidate, value):
             f" -X github.com/ebenderooock/loom/internal/buildinfo.Version={value}"
             f" -X github.com/ebenderooock/loom/internal/buildinfo.Commit={candidate['sha']}"
             f" -X github.com/ebenderooock/loom/internal/buildinfo.Date={candidate['date']}"
+            f" -X github.com/ebenderooock/loom/internal/buildinfo.SourceRef={candidate['ref']}"
         )
         run("go", "build", "-trimpath", "-tags", "embed", "-ldflags", ldflags,
             "-o", str(directory / binary), "./cmd/loom", env=env)
+        if system != "windows" and ref_policy(candidate["ref"])[0] != "release":
+            run("go", "build", "-trimpath", "-o", str(directory / "loom-updater"),
+                "./cmd/loom-updater", env=env)
         for name in ("LICENSE", "README.md", "CHANGELOG.md"):
             shutil.copyfile(SOURCE / name, directory / name)
         packaging = "macos" if system == "darwin" else system
@@ -78,13 +82,14 @@ def release(candidate, value):
     for archive in sorted(assets.iterdir()):
         run(syft, "scan", "file:" + str(archive), "-o",
             "spdx-json=" + str(archive) + ".sbom.spdx.json")
-    # Buildx only assembles these cross-compiled binaries; no arm emulation.
-    dockerfile = ROOT / "release.Dockerfile"
-    context = ROOT / "work" / "images"
-    context.mkdir()
-    for arch in ("amd64", "arm64"):
-        shutil.copyfile(ROOT / "work" / ("linux-" + arch) / "loom", context / ("loom-" + arch))
-    image(candidate, value, dockerfile, context, "linux/amd64,linux/arm64")
+    if ref_policy(candidate["ref"])[0] == "release":
+        # Buildx only assembles these cross-compiled binaries; no arm emulation.
+        dockerfile = ROOT / "release.Dockerfile"
+        context = ROOT / "work" / "images"
+        context.mkdir()
+        for arch in ("amd64", "arm64"):
+            shutil.copyfile(ROOT / "work" / ("linux-" + arch) / "loom", context / ("loom-" + arch))
+        image(candidate, value, dockerfile, context, "linux/amd64,linux/arm64")
 
 
 def image(candidate, value, dockerfile, context, platforms):
@@ -105,9 +110,9 @@ def main():
     require(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SOURCE,
                                     text=True).strip() == candidate["sha"], "Wrong source checkout")
     OUTPUT.mkdir()
-    if kind == "release":
-        release(candidate, value)
-    else:
+    if kind != "main":
+        release(candidate, native_update_source(candidate)[1])
+    if kind != "release":
         value = (subprocess.check_output(["git", "describe", "--tags", "--always"],
                                         cwd=SOURCE, text=True).strip()
                  if kind == "main" else

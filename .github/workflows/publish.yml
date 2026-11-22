@@ -141,16 +141,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        if: startsWith(fromJSON(needs.discover.outputs.candidate).ref, 'refs/tags/')
+        if: fromJSON(needs.discover.outputs.candidate).ref != 'refs/heads/main'
         with:
           go-version: "1.26.11"
           cache: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: startsWith(fromJSON(needs.discover.outputs.candidate).ref, 'refs/tags/')
+        if: fromJSON(needs.discover.outputs.candidate).ref != 'refs/heads/main'
         with:
           node-version: "22"
       - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
-        if: startsWith(fromJSON(needs.discover.outputs.candidate).ref, 'refs/tags/')
+        if: fromJSON(needs.discover.outputs.candidate).ref != 'refs/heads/main'
         id: syft
         with:
           syft-version: v1.57.1
@@ -220,6 +220,7 @@ jobs:
           PUBLISHING_NOT_BEFORE: ${{ vars.PUBLISHING_NOT_BEFORE }}
           PUBLISHER_RUN_URL: https://github.com/Ebenderooock/loom-publisher/actions/runs/${{ github.run_id }}
           SOURCE_REF: ${{ inputs.source_ref }}
+          PRELEASE_RETENTION: ${{ vars.PRELEASE_RETENTION }}
         run: |
           python3 release_start.py verify
           python3 publisher.py publish
