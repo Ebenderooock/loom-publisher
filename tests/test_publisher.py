@@ -681,6 +681,7 @@ class NativeUpdateTests(unittest.TestCase):
         api = Mock()
         with patch.dict(os.environ, LOOM_UPDATE_SIGNING_KEY=""), \
                 patch("publisher.validate_oci"), \
+                patch("publisher.release_notes", return_value="- Notes."), \
                 patch("publisher.subprocess.run") as command:
             with self.assertRaisesRegex(ValueError, "LOOM_UPDATE_SIGNING_KEY"):
                 p.publish(api, candidate, root)
@@ -779,6 +780,23 @@ class ReleaseNotesTests(unittest.TestCase):
                 self.assertEqual(self.notes(
                     "## [0.4.2]\n- Fix.\n" + boundary + "\nNot release notes."), "- Fix.")
 
+    def test_channel_prerelease_notes_use_exact_branch_version_at_source_sha(self):
+        candidate = {"ref": "refs/heads/prelease/0.4.7", "sha": SHA}
+        self.api.call.return_value = changelog_file(
+            "## [Unreleased]\n\n- Future work.\n\n"
+            "## [0.4.7] - 2026-11-23\n\n### Fixed\n\n- Accept collection links.\n"
+            "## [0.4.6] - 2026-11-17\n\n- Earlier fix.")
+        self.assertEqual(
+            p.release_notes(self.api, candidate),
+            "### Fixed\n\n- Accept collection links.")
+        self.api.call.assert_called_once_with(
+            p.source_path("contents/CHANGELOG.md?ref=" + SHA))
+        self.api.call.reset_mock()
+        self.api.call.return_value = changelog_file(
+            "## [Unreleased]\n- Future work.\n## [0.4.6]\n- Older notes.")
+        with self.assertRaisesRegex(ValueError, "Missing CHANGELOG.md section for 0.4.7"):
+            p.release_notes(self.api, candidate)
+
     def test_version_heading_forms_and_exact_prerelease_metadata(self):
         for heading in ("## [0.4.2]", "## 0.4.2", "## 0.4.2 - 2026-01-02",
                         "  ## [0.4.2] - 2026-01-02 ##"):
@@ -847,6 +865,40 @@ class ReleaseNotesTests(unittest.TestCase):
 
 
 class PublicationTests(unittest.TestCase):
+    def test_legacy_channel_branch_without_a_section_keeps_publishing(self):
+        ref = "refs/heads/prelease/0.4.6"
+        api = FakeAPI(ref)
+        api.changelog = changelog_file("## [Unreleased]\n\n- Existing branch changes.")
+        candidate = p.authorize(api, ref)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "image.tar").write_bytes(b"opaque")
+            (directory / "assets").mkdir()
+            with patch("publisher.validate_oci"), \
+                    patch("publisher.validate_assets", return_value={}), \
+                    patch("publisher.sign_update_manifest"), \
+                    patch("publisher.revalidate"), \
+                    patch("publisher.subprocess.run"), \
+                    patch("publisher.release_notes") as notes, \
+                    patch("publisher.publish_prelease") as publish_prelease:
+                p.publish(api, candidate, directory)
+        notes.assert_not_called()
+        self.assertEqual(publish_prelease.call_args.args[-1], "")
+
+    def test_new_channel_branch_without_a_section_fails_before_publication(self):
+        ref = "refs/heads/prerelease/0.4.7"
+        api = FakeAPI(ref)
+        api.changelog = changelog_file("## [Unreleased]\n\n- New branch changes.")
+        candidate = p.authorize(api, ref)
+        writes_before = list(api.writes)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("publisher.subprocess.run") as command:
+                with self.assertRaisesRegex(
+                        ValueError, "Missing CHANGELOG.md section for 0.4.7"):
+                    p.publish(api, candidate, Path(tmp))
+        self.assertEqual(api.writes, writes_before)
+        command.assert_not_called()
+
     def test_release_notes_remain_data_beneath_the_publisher_marker(self):
         candidate = p.authorize(FakeAPI("refs/tags/v1.2.3"), "refs/tags/v1.2.3")
         notes = "## Changes\n\n* Fix media imports."
@@ -1008,6 +1060,8 @@ class PublicationTests(unittest.TestCase):
                 else:
                     release.assert_not_called()
                     self.assertEqual(prelease.call_count, int(ref != "refs/heads/main"))
+                    if ref != "refs/heads/main":
+                        self.assertEqual(prelease.call_args.args[-1], "- Fixes.")
 
     def test_existing_public_release_refused_before_any_registry_write(self):
         candidate = p.authorize(FakeAPI("refs/tags/v1.2.3"), "refs/tags/v1.2.3")

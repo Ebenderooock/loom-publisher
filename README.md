@@ -415,29 +415,36 @@ Main/channel images retain the source Dockerfile, Rain and TVDB build argument.
 
 ### Release notes
 
-For `v<semver>` tags, the trusted publisher reads **`CHANGELOG.md` from the exact
-peeled source commit SHA**, through the source repository Contents API. Before
-any image or release writes, it requires one non-empty level-two section for
-that exact version (including any prerelease/build metadata), for example
-`## [0.4.2] - 2026-11-17`. Bracketed or bare versions, with or without a date,
+For all `v<semver>` tags, and `prelease/X.Y.Z` or `prerelease/X.Y.Z` branches
+from `0.4.7` onward, the trusted publisher reads **`CHANGELOG.md` from the exact
+source commit SHA**, through the source repository Contents API. Before any
+image or release writes, it requires one non-empty level-two section for that
+exact version (including any prerelease/build metadata), for example
+`## [0.4.7] - 2026-11-23`. Bracketed or bare versions, with or without a date,
 are supported. The heading is omitted; the Markdown body ends at the next
 level-two heading, retaining nested headings and lists. Fenced examples are
 not interpreted as section headings.
 
 Missing/unreadable files, missing/empty sections, and duplicate matching
 sections fail publication. There is **no Unreleased or generated-notes
-fallback**. Prepare the versioned changelog before tagging; a later main-branch
-edit cannot repair the changelog at an existing tag. Standard inline/image
-links and reference definitions within the section resolve relative paths
-against the source repository's `blob/<SHA>/` URLs (fragment-only links point
-to `CHANGELOG.md` at that SHA); absolute URLs are unchanged. Keep referenced
-link definitions inside the versioned section, or use absolute URLs.
+fallback** for these releases. Prepare the versioned changelog in the source
+commit; a later main-branch edit cannot repair an existing tag or branch tip.
+Existing channel branches through `0.4.6` retain their previous publishing
+behavior and do not require a matching section. Standard inline/image links and
+reference definitions within a versioned section resolve relative paths
+against the source repository's `blob/<SHA>/` URLs
+(fragment-only links point to `CHANGELOG.md` at that SHA); absolute URLs are
+unchanged. Keep referenced link definitions inside the versioned section, or
+use absolute URLs.
 
-The trusted publisher run-link marker remains the first paragraph. Recovery
-of an App-owned matching draft validates the changelog again and replaces old
-notes with this body when finalizing, after asset uploads and the existing
-ownership/ref/CI checks. Source Markdown is inert data: no source scripts,
-templates, or GoReleaser configuration run in publication jobs.
+The trusted publisher run-link marker remains the first paragraph. Branch
+prerelease bodies also retain their source-ref/SHA provenance marker before the
+changelog notes. Existing three-line prerelease bodies remain recognizable for
+ownership and retention. Recovery of an App-owned matching draft validates the
+changelog again and replaces old notes with this body when finalizing, after
+asset uploads and the existing ownership/ref/CI checks. Source Markdown is
+inert data: no source scripts, templates, or GoReleaser configuration run in
+publication jobs.
 
 ## Retry and limitations
 
