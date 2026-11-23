@@ -23,6 +23,7 @@ CI_ID = 271638826
 CI_PATH = ".github/workflows/ci.yml"
 NUMBER = r"(?:0|[1-9][0-9]*)"
 CORE = rf"{NUMBER}\.{NUMBER}\.{NUMBER}"
+PRELEASE_NOTES_REQUIRED_FROM = (0, 4, 7)
 SEMVER = re.compile(
     rf"^({CORE})(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
@@ -608,8 +609,9 @@ def registry_latest():
 
 def release_notes(api, candidate):
     kind, value = ref_policy(candidate["ref"])
-    require(kind == "release" and SHA.fullmatch(candidate["sha"]),
-            "Release notes require a tagged source commit")
+    require(kind in ("release", "prelease", "prerelease")
+            and SHA.fullmatch(candidate["sha"]),
+            "Release notes require a releasable source commit")
     file = api.call(source_path("contents/CHANGELOG.md?ref=" + candidate["sha"]))
     require(file.get("type") == "file" and file.get("encoding") == "base64"
             and isinstance(file.get("content"), str), "Missing CHANGELOG.md content")
@@ -732,7 +734,7 @@ def owned_prelease(release, value):
         lines[2] if len(lines) > 2 else "")
     return (match is not None and release.get("prerelease") is True
             and (release.get("author") or {}).get("login") == os.environ["APP_SLUG"] + "[bot]"
-            and len(lines) == 3 and lines[1] == "" and marker is not None
+            and len(lines) >= 3 and lines[1] == "" and marker is not None
             and marker[1] == release.get("target_commitish")
             and re.fullmatch(
                 r"Built by the trusted \[publisher\]\(https://github\.com/"
@@ -745,8 +747,11 @@ def prelease_tag_sha(api, tag, sha):
             "Prerelease tag does not point to source SHA")
 
 
-def publish_prelease(api, candidate, directory, retention):
+def publish_prelease(api, candidate, directory, retention, notes):
     _, value = ref_policy(candidate["ref"])
+    body = ("Built by the trusted [publisher](" + os.environ["PUBLISHER_RUN_URL"]
+            + ").\n\n" + prelease_marker(candidate)
+            + ("\n\n" + notes if notes else ""))
     releases = list(api.pages(source_path("releases")))
     matching = [r for r in releases if owned_prelease(r, value)
                 and prelease_marker(candidate) in (r.get("body") or "").splitlines()
@@ -766,8 +771,6 @@ def publish_prelease(api, candidate, directory, retention):
         api.call(source_path("git/refs"), {"ref": "refs/tags/" + tag,
                                            "sha": candidate["sha"]})
         prelease_tag_sha(api, tag, candidate["sha"])
-        body = ("Built by the trusted [publisher](" + os.environ["PUBLISHER_RUN_URL"]
-                + ").\n\n" + prelease_marker(candidate))
         release = api.call(source_path("releases"), {
             "tag_name": tag, "target_commitish": candidate["sha"], "name": tag,
             "body": body, "draft": True, "prerelease": True, "make_latest": "false",
@@ -828,9 +831,12 @@ def publish_prelease(api, candidate, directory, retention):
                 and prelease_marker(candidate) in current["body"].splitlines(),
                 "Prerelease draft changed before publication")
         prelease_tag_sha(api, tag, candidate["sha"])
-        api.call(source_path(f"releases/{release_id}"), {
+        publication = {
             "draft": False, "prerelease": True, "make_latest": "false",
-        }, method="PATCH")
+        }
+        if notes:
+            publication["body"] = body
+        api.call(source_path(f"releases/{release_id}"), publication, method="PATCH")
         prelease_tag_sha(api, tag, candidate["sha"])
     else:
         require(release.get("draft") is False, "Invalid prerelease state")
@@ -871,6 +877,9 @@ def publish(api, candidate, directory):
         existing = release_record(api, candidate["ref"])
         if existing:
             require_owned_draft(existing, candidate)
+    notes = ""
+    if kind == "release" or (
+            branch_release and version(value)[0] >= PRELEASE_NOTES_REQUIRED_FROM):
         # Fail before any registry/release writes, including on draft recovery.
         notes = release_notes(api, candidate)
     require({p.name for p in directory.iterdir()} ==
@@ -925,7 +934,7 @@ def publish(api, candidate, directory):
         publish_release(api, candidate, directory / "assets", advance, notes)
     elif branch_release:
         revalidate(api, candidate)
-        publish_prelease(api, candidate, directory / "assets", retention)
+        publish_prelease(api, candidate, directory / "assets", retention, notes)
 
 
 def main():

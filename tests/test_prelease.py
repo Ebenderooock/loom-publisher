@@ -12,6 +12,7 @@ import publisher as p
 SHA = "a" * 40
 OTHER = "b" * 40
 URL = "https://github.com/Ebenderooock/loom-publisher/actions/runs/123"
+NOTES = "### Fixed\n\n- Accept collection links."
 CANDIDATE = {"ref": "refs/heads/prelease/1.2.3", "sha": SHA,
              "ci_id": 100, "ci_attempt": 2}
 
@@ -116,10 +117,14 @@ class PreleaseTests(unittest.TestCase):
                 api.tags = {r["tag_name"]: r["target_commitish"] for r in api.releases}
                 api.tags["v1.2.3-pre.12"] = OTHER  # deleted release tag
                 candidate = CANDIDATE | {"ref": f"refs/heads/{alias}/1.2.3"}
-                p.publish_prelease(api, candidate, self.directory, 3)
+                p.publish_prelease(api, candidate, self.directory, 3, NOTES)
                 current = next(r for r in api.releases if r["target_commitish"] == SHA)
                 self.assertEqual(current["tag_name"], "v1.2.3-pre.13")
                 self.assertFalse(current["draft"])
+                self.assertEqual(
+                    current["body"],
+                    f"Built by the trusted [publisher]({URL}).\n\n"
+                    f"Source: {candidate['ref']} @ {SHA}\n\n{NOTES}")
                 self.assertEqual(api.tags[current["tag_name"]], SHA)
                 self.assertEqual({r["tag_name"] for r in api.releases},
                                  {"v1.2.3-pre.3", "v1.2.3-pre.4", "v1.2.3-pre.8",
@@ -128,8 +133,35 @@ class PreleaseTests(unittest.TestCase):
                 self.assertNotIn("v1.2.3-pre.2", api.tags)
                 self.assertIn("v1.2.3-pre.12", api.tags)
                 before = len(api.writes)
-                p.publish_prelease(api, candidate, self.directory, 3)
+                p.publish_prelease(api, candidate, self.directory, 3, NOTES)
                 self.assertEqual(len(api.writes), before)
+
+    def test_ownership_preserves_legacy_body_and_accepts_trailing_release_notes(self):
+        legacy = release(1)
+        with patch.dict(os.environ, APP_SLUG="publisher"):
+            self.assertTrue(p.owned_prelease(legacy, "1.2.3"))
+            with_notes = legacy | {
+                "body": legacy["body"] + "\n\n### Fixed\n\n- Human-readable change."}
+            self.assertTrue(p.owned_prelease(with_notes, "1.2.3"))
+
+    def test_empty_legacy_notes_keep_the_original_body_format(self):
+        api = MemoryAPI()
+        p.publish_prelease(api, CANDIDATE, self.directory, 3, "")
+        self.assertEqual(api.releases[0]["body"],
+                         f"Built by the trusted [publisher]({URL}).\n\n"
+                         f"Source: {CANDIDATE['ref']} @ {SHA}")
+        self.assertTrue(p.owned_prelease(api.releases[0], "1.2.3"))
+
+    def test_resumed_draft_receives_validated_notes_before_publication(self):
+        api = MemoryAPI()
+        api.releases = [release(1, SHA, draft=True)]
+        api.tags["v1.2.3-pre.1"] = SHA
+        p.publish_prelease(api, CANDIDATE, self.directory, 3, NOTES)
+        self.assertEqual(
+            api.releases[0]["body"],
+            f"Built by the trusted [publisher]({URL}).\n\n"
+            f"Source: {CANDIDATE['ref']} @ {SHA}\n\n{NOTES}")
+        self.assertFalse(api.releases[0]["draft"])
 
     def test_failed_upload_and_digest_leave_draft_and_resume(self):
         for failure in ("upload", "digest"):
@@ -138,11 +170,11 @@ class PreleaseTests(unittest.TestCase):
                 api.fail_upload = failure == "upload"
                 api.bad_digest = failure == "digest"
                 with self.assertRaises((RuntimeError, ValueError)):
-                    p.publish_prelease(api, CANDIDATE, self.directory, 3)
+                    p.publish_prelease(api, CANDIDATE, self.directory, 3, NOTES)
                 self.assertEqual(len(api.releases), 1)
                 self.assertTrue(api.releases[0]["draft"])
                 api.fail_upload = api.bad_digest = False
-                p.publish_prelease(api, CANDIDATE, self.directory, 3)
+                p.publish_prelease(api, CANDIDATE, self.directory, 3, NOTES)
                 self.assertEqual(len(api.releases), 1)
                 self.assertFalse(api.releases[0]["draft"])
 
@@ -151,11 +183,11 @@ class PreleaseTests(unittest.TestCase):
         api.releases = [release(1, SHA)]
         api.tags["v1.2.3-pre.1"] = OTHER
         with self.assertRaisesRegex(ValueError, "tag does not point"):
-            p.publish_prelease(api, CANDIDATE, self.directory, 3)
+            p.publish_prelease(api, CANDIDATE, self.directory, 3, NOTES)
         self.assertEqual(api.writes, [])
         api.releases.append(release(2, SHA))
         with self.assertRaisesRegex(ValueError, "Multiple prereleases"):
-            p.publish_prelease(api, CANDIDATE, self.directory, 3)
+            p.publish_prelease(api, CANDIDATE, self.directory, 3, NOTES)
 
     def test_retention_refuses_to_delete_release_with_moved_tag(self):
         api = MemoryAPI()
@@ -163,7 +195,7 @@ class PreleaseTests(unittest.TestCase):
         api.tags = {r["tag_name"]: r["target_commitish"] for r in api.releases}
         api.tags["v1.2.3-pre.4"] = SHA
         with self.assertRaisesRegex(ValueError, "tag does not point"):
-            p.publish_prelease(api, CANDIDATE, self.directory, 1)
+            p.publish_prelease(api, CANDIDATE, self.directory, 1, NOTES)
         self.assertIn("v1.2.3-pre.4", api.tags)
         self.assertTrue(any(r["tag_name"] == "v1.2.3-pre.4" for r in api.releases))
 
@@ -173,7 +205,7 @@ class PreleaseTests(unittest.TestCase):
         api.tags["v1.2.3-pre.1"] = SHA
         old = "loom_1.2.3-pre.100.1_linux_amd64.tar.gz"
         api.assets[1] = {old: {"id": 5, "name": old, "digest": "sha256:" + "0" * 64}}
-        p.publish_prelease(api, CANDIDATE, self.directory, 3)
+        p.publish_prelease(api, CANDIDATE, self.directory, 3, NOTES)
         self.assertNotIn(old, api.assets[1])
         self.assertFalse(api.releases[0]["draft"])
 
@@ -184,7 +216,7 @@ class PreleaseTests(unittest.TestCase):
         name = "loom_1.2.3-pre.100.1_surprise.txt"
         api.assets[1] = {name: {"id": 5, "name": name, "digest": "sha256:" + "0" * 64}}
         with self.assertRaisesRegex(ValueError, "Unexpected existing draft assets"):
-            p.publish_prelease(api, CANDIDATE, self.directory, 3)
+            p.publish_prelease(api, CANDIDATE, self.directory, 3, NOTES)
         self.assertEqual(api.writes, [])
 
     def test_retention_configuration_rejects_invalid_values(self):
